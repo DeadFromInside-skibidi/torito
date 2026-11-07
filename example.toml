@@ -1,0 +1,87 @@
+# Torito Example Build Manifest
+# ================================
+# This TOML file configures the ISO compiler to build a minimal
+# bootable Linux image. Edit the paths below to point at your
+# actual kernel, bootloader, packages, and overlay directories.
+
+name        = "MyLinux"
+version     = "1.0.0"
+arch        = "x86_64"
+hostname    = "mylinux"
+locale      = "en_US.UTF-8"
+timezone    = "America/New_York"
+keymap      = "us"
+
+# Uncomment and set for bit-for-bit reproducibility:
+# source_date_epoch = 1700000000
+
+# Directories whose contents are overlaid onto the rootfs.
+# Structure mirrors Linux root: overlays/etc/motd → /etc/motd
+rootfs_overlay_dirs = [
+    "overlays/rootfs",
+]
+
+# ── Kernel ──────────────────────────────────────────────────
+[kernel]
+vmlinuz        = "boot/vmlinuz-linux"
+modules_dir    = "boot/modules"
+cmdline        = "root=live:CDLABEL=MYLINUX rd.live.image quiet splash"
+
+# Extra files/dirs to include in the initramfs
+initramfs_extra_dirs  = []
+initramfs_extra_files = []
+
+# ── Bootloader ──────────────────────────────────────────────
+[bootloader]
+efi_binary  = "boot/BOOTX64.EFI"     # Prebuilt GRUB/Limine/systemd-boot EFI binary
+bios_binary = "boot/isolinux.bin"     # El Torito BIOS boot image (optional)
+
+# ── Packages ────────────────────────────────────────────────
+# Each entry is a local path to a package archive.
+# Supported formats: .pkg.tar.zst (Pacman), .deb (Debian), .apk (Alpine)
+[[packages]]
+path   = "packages/base-1.0-1-x86_64.pkg.tar.zst"
+format = "auto"
+
+# [[packages]]
+# path   = "packages/linux-6.6-1-x86_64.pkg.tar.zst"
+
+# ── Users ───────────────────────────────────────────────────
+[[users]]
+name     = "admin"
+uid      = 1000
+gid      = 1000
+home     = "/home/admin"
+shell    = "/bin/bash"
+password = "changeme"         # Will be SHA-512 hashed automatically
+groups   = ["wheel", "audio", "video", "storage"]
+gecos    = "Admin User"
+
+# ── Groups ──────────────────────────────────────────────────
+[[groups]]
+name    = "admin"
+gid     = 1000
+members = ["admin"]
+
+# ── Services ────────────────────────────────────────────────
+# Services to enable at boot (like `systemctl enable <service>`)
+[[services]]
+name        = "NetworkManager"
+init_system = "systemd"
+target      = "multi-user.target"
+
+[[services]]
+name        = "sshd"
+init_system = "systemd"
+target      = "multi-user.target"
+
+# ── ISO Output ──────────────────────────────────────────────
+[iso]
+output                = "output/mylinux-x86_64.iso"
+volume_id             = "MYLINUX"
+publisher_id          = "MyLinux Project"
+application_id        = "MYLINUX"
+system_id             = "LINUX"
+squashfs_compression  = "zstd"
+squashfs_block_size   = 131072     # 128 KiB
+
