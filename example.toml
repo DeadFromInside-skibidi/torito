@@ -1,87 +1,97 @@
-# Torito Example Build Manifest
-# ================================
-# This TOML file configures the ISO compiler to build a minimal
-# bootable Linux image. Edit the paths below to point at your
-# actual kernel, bootloader, packages, and overlay directories.
+# Torito example manifest — a small Arch-based live system
+# =========================================================
+# Build:   python -m torito example.toml -v
+# Result:  output/mylinux-x86_64.iso (boots on BIOS and UEFI, CD/DVD or USB)
+#
+# Everything below is optional except `name` and `packages`.
 
 name        = "MyLinux"
 version     = "1.0.0"
 arch        = "x86_64"
 hostname    = "mylinux"
 locale      = "en_US.UTF-8"
-timezone    = "America/New_York"
+timezone    = "UTC"
 keymap      = "us"
+default_target = "multi-user.target"      # or "graphical.target"
+# source_date_epoch = 1700000000          # reproducible timestamps
 
-# Uncomment and set for bit-for-bit reproducibility:
-# source_date_epoch = 1700000000
+cache_dir = ".torito-cache"               # package cache (reused between builds)
+work_dir  = ".torito-work"
 
-# Directories whose contents are overlaid onto the rootfs.
-# Structure mirrors Linux root: overlays/etc/motd → /etc/motd
-rootfs_overlay_dirs = [
-    "overlays/rootfs",
+# --- Packages ------------------------------------------------------------------
+# Names are resolved (with dependencies) from the repositories below. Strings
+# that look like files ("pkgs/foo-1-1-x86_64.pkg.tar.zst") are installed from
+# disk instead. A kernel package is required for a bootable image.
+packages = [
+    "base", "linux", "linux-firmware",
+    "networkmanager", "openssh", "sudo", "nano",
 ]
 
-# ── Kernel ──────────────────────────────────────────────────
-[kernel]
-vmlinuz        = "boot/vmlinuz-linux"
-modules_dir    = "boot/modules"
-cmdline        = "root=live:CDLABEL=MYLINUX rd.live.image quiet splash"
+# Without [[repositories]] Torito uses Arch Linux core + extra.
+# [[repositories]]
+# name    = "core"
+# servers = ["https://fastly.mirror.pkgbuild.com/$repo/os/$arch"]
+# [[repositories]]
+# name    = "extra"
+# servers = ["https://fastly.mirror.pkgbuild.com/$repo/os/$arch"]
 
-# Extra files/dirs to include in the initramfs
-initramfs_extra_dirs  = []
-initramfs_extra_files = []
+# Pick a provider when several packages provide the same thing.
+package_preferences = { jack = "pipewire-jack" }
+# ignore_packages = ["some-dependency"]
 
-# ── Bootloader ──────────────────────────────────────────────
-[bootloader]
-efi_binary  = "boot/BOOTX64.EFI"     # Prebuilt GRUB/Limine/systemd-boot EFI binary
-bios_binary = "boot/isolinux.bin"     # El Torito BIOS boot image (optional)
+# --- Files -----------------------------------------------------------------------
+# Host directories laid over / (Windows CRLF line endings are converted).
+rootfs_overlay_dirs = ["overlays/rootfs"]
 
-# ── Packages ────────────────────────────────────────────────
-# Each entry is a local path to a package archive.
-# Supported formats: .pkg.tar.zst (Pacman), .deb (Debian), .apk (Alpine)
-[[packages]]
-path   = "packages/base-1.0-1-x86_64.pkg.tar.zst"
-format = "auto"
+# owner:group:mode — Windows cannot express Linux permissions, set them here.
+file_permissions = { "/etc/sudoers.d/10-wheel" = "0:0:440" }
 
-# [[packages]]
-# path   = "packages/linux-6.6-1-x86_64.pkg.tar.zst"
+# Trim the image.
+remove_paths = ["/usr/share/doc", "/usr/share/gtk-doc"]
 
-# ── Users ───────────────────────────────────────────────────
+# --- Users & services ------------------------------------------------------------
 [[users]]
-name     = "admin"
-uid      = 1000
-gid      = 1000
-home     = "/home/admin"
-shell    = "/bin/bash"
-password = "changeme"         # Will be SHA-512 hashed automatically
-groups   = ["wheel", "audio", "video", "storage"]
-gecos    = "Admin User"
+name     = "live"
+password = "live"                        # SHA-512 hashed at build time; "" = no password
+groups   = ["wheel", "audio", "video", "network", "storage"]
 
-# ── Groups ──────────────────────────────────────────────────
-[[groups]]
-name    = "admin"
-gid     = 1000
-members = ["admin"]
-
-# ── Services ────────────────────────────────────────────────
-# Services to enable at boot (like `systemctl enable <service>`)
-[[services]]
-name        = "NetworkManager"
-init_system = "systemd"
-target      = "multi-user.target"
+[[users]]
+name     = "root"
+password = "root"
 
 [[services]]
-name        = "sshd"
-init_system = "systemd"
-target      = "multi-user.target"
+name = "NetworkManager"                  # honours [Install] WantedBy/Alias/Also
 
-# ── ISO Output ──────────────────────────────────────────────
+[[services]]
+name = "sshd"
+
+# [[services]]
+# name = "pipewire.socket"
+# user = true                            # systemctl --global enable
+
+# --- Boot --------------------------------------------------------------------------
+[kernel]
+cmdline = "quiet"                         # appended to Torito's live arguments
+# package = "linux-lts"                   # pick a kernel when several are installed
+# initramfs_modules = ["nvme"]            # extra drivers for the live initramfs
+
+[bootloader]
+bios       = "syslinux"                   # or "none"
+uefi       = "systemd-boot"               # or "none"
+timeout    = 5
+menu_title = "MyLinux 1.0.0"
+
+[live]
+copytoram      = false                    # boot entry "copy to RAM" is always offered
+overlay_size   = "75%"                    # tmpfs size for writes
+serial_console = true                     # also log to ttyS0 (handy for VMs/CI)
+
+# --- Output ------------------------------------------------------------------------
 [iso]
-output                = "output/mylinux-x86_64.iso"
-volume_id             = "MYLINUX"
-publisher_id          = "MyLinux Project"
-application_id        = "MYLINUX"
-system_id             = "LINUX"
-squashfs_compression  = "zstd"
-squashfs_block_size   = 131072     # 128 KiB
-
+output               = "output/mylinux-x86_64.iso"
+volume_id            = "MYLINUX_LIVE"     # also how the initramfs finds the medium
+publisher_id         = "MyLinux Project"
+application_id       = "MyLinux Live"
+squashfs_compression = "zstd"             # zstd | xz | gzip
+squashfs_block_size  = 1048576
+squashfs_level       = 15

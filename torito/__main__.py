@@ -1,187 +1,169 @@
 """
 torito.__main__ — CLI & GUI entry point
-==========================================
-Provides both a GUI launcher and a headless CLI mode for automated builds.
+=======================================
+
+    python -m torito distro.toml          build headlessly
+    python -m torito distro.toml -v       … with full telemetry
+    python -m torito --inspect out.iso    report on an ISO
+    python -m torito --verify out.iso     exit 1 if the ISO looks unbootable
+    python -m torito --init mydistro      scaffold a project
+    python -m torito                      GUI
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import struct
 import sys
-import time
+import threading
+
+from . import __version__
+
+
+def _utf8_console() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
+
+SCAFFOLD_MANIFEST = """# Torito build manifest for {name}
+# Build:  python -m torito distro.toml -v
+name        = "{name}"
+version     = "1.0.0"
+arch        = "x86_64"
+hostname    = "{slug}"
+locale      = "en_US.UTF-8"
+timezone    = "UTC"
+keymap      = "us"
+default_target = "multi-user.target"
+
+# Packages come from the Arch Linux repositories (core + extra) unless
+# [[repositories]] says otherwise. Dependencies are resolved automatically.
+packages = [
+    "base", "linux", "linux-firmware",
+    "networkmanager", "sudo", "nano", "vim",
+]
+
+# Files copied over the root filesystem (Windows line endings are fixed).
+rootfs_overlay_dirs = ["overlays/rootfs"]
+
+file_permissions = {{ "/etc/sudoers.d/10-wheel" = "0:0:440" }}
+
+[[users]]
+name     = "live"
+password = "live"
+groups   = ["wheel", "audio", "video", "network", "storage", "input"]
+
+[[users]]
+name     = "root"
+password = "root"
+
+[[services]]
+name = "NetworkManager"
+
+[iso]
+output    = "output/{slug}-x86_64.iso"
+volume_id = "{label}"
+"""
 
 
 def _scaffold_project(target_dir: str) -> int:
-    """Scaffold a ready-to-compile distribution project skeleton."""
     abs_dir = os.path.abspath(target_dir)
-    os.makedirs(os.path.join(abs_dir, "overlays", "rootfs", "etc"), exist_ok=True)
-    os.makedirs(os.path.join(abs_dir, "boot"), exist_ok=True)
-    os.makedirs(os.path.join(abs_dir, "packages"), exist_ok=True)
+    name = os.path.basename(abs_dir.rstrip("\\/")).capitalize() or "Mydistro"
+    slug = name.lower()
+    os.makedirs(os.path.join(abs_dir, "overlays", "rootfs", "etc", "sudoers.d"), exist_ok=True)
     os.makedirs(os.path.join(abs_dir, "output"), exist_ok=True)
-
-    # 1. Overlay files
-    motd_path = os.path.join(abs_dir, "overlays", "rootfs", "etc", "motd")
-    with open(motd_path, "wb") as f:
-        f.write(b"Welcome to Torito Linux! Booted directly on userspace hardware.\n")
-
-    # 2. Mock EFI stub and kernel
-    efi_path = os.path.join(abs_dir, "boot", "BOOTX64.EFI")
-    with open(efi_path, "wb") as f:
-        # Minimal PE/COFF header stub
-        f.write(b"MZ\x90\x00" + b"\x00" * 58 + struct.pack("<I", 0x80) + b"\x00" * 64 + b"PE\x00\x00\x64\x86" + b"\xCC" * 1024)
-
-    kernel_path = os.path.join(abs_dir, "boot", "vmlinuz-linux")
-    with open(kernel_path, "wb") as f:
-        f.write(b"\x1f\x8b\x08\x00fake-vmlinuz-linux-kernel-binary-stream" + b"\x00" * 2048)
-
-    # 3. Declarative manifest
-    manifest_path = os.path.join(abs_dir, "distro.toml")
-    distro_name = os.path.basename(abs_dir).capitalize()
-    manifest_content = f"""# Torito Build Manifest for {distro_name}
-name        = "{distro_name}"
-version     = "1.0.0"
-arch        = "x86_64"
-hostname    = "{distro_name.lower()}"
-locale      = "en_US.UTF-8"
-timezone    = "UTC"
-
-rootfs_overlay_dirs = [
-    "overlays/rootfs",
-]
-
-[kernel]
-vmlinuz = "boot/vmlinuz-linux"
-cmdline = "root=live:CDLABEL={distro_name.upper()} rd.live.image quiet splash"
-
-[bootloader]
-efi_binary = "boot/BOOTX64.EFI"
-
-[[users]]
-name     = "user"
-uid      = 1000
-gid      = 1000
-password = "live"
-groups   = ["wheel", "audio", "video"]
-
-[[services]]
-name        = "systemd-networkd"
-init_system = "systemd"
-
-[iso]
-output               = "output/{distro_name.lower()}-x86_64.iso"
-volume_id            = "{distro_name.upper()}"
-squashfs_compression = "zstd"
-"""
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        f.write(manifest_content)
-
-    print(f"✓ Created new Torito distribution project at: {abs_dir}")
-    print(f"  Manifest:   {manifest_path}")
-    print(f"  Compile:    python -m torito {os.path.relpath(manifest_path)}")
-    print(f"  GUI:        python -m torito --gui")
+    with open(os.path.join(abs_dir, "overlays", "rootfs", "etc", "motd"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"Welcome to {name}! Built with Torito.\n")
+    with open(os.path.join(abs_dir, "overlays", "rootfs", "etc", "sudoers.d", "10-wheel"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("%wheel ALL=(ALL:ALL) ALL\n")
+    manifest = os.path.join(abs_dir, "distro.toml")
+    with open(manifest, "w", encoding="utf-8", newline="\n") as f:
+        f.write(SCAFFOLD_MANIFEST.format(name=name, slug=slug, label=(slug.upper() + "_LIVE")[:32]))
+    print(f"✓ Created Torito project at {abs_dir}")
+    print(f"  Build: python -m torito {manifest} -v")
     return 0
 
 
-def _cli_build(manifest_path: str, verbose: bool = False) -> int:
-    """Run a headless build from the command line."""
-    from .builder import BuildController, BuildResult, BuildStage
+def _cli_build(manifest_path: str, verbose: bool = False, keep_work: bool = False) -> int:
+    from .builder import TOTAL_STAGES, BuildController, BuildResult, BuildStage
 
     controller = BuildController()
-    result_holder: list = []
-    done_event = __import__("threading").Event()
+    controller.keep_work = keep_work
+    holder: list = []
+    done = threading.Event()
 
     def on_log(msg: str) -> None:
-        if verbose:
+        if verbose or msg.startswith(("✗", "⚠", "  ⚠")):
             print(msg, flush=True)
 
     def on_stage(stage: BuildStage, label: str) -> None:
-        print(f"[{stage.value:2d}/{10}] {label}", flush=True)
+        if 0 < stage.value <= TOTAL_STAGES:
+            print(f"[{stage.value:2d}/{TOTAL_STAGES}] {label}", flush=True)
 
     def on_finished(result: BuildResult) -> None:
-        result_holder.append(result)
-        done_event.set()
+        holder.append(result)
+        done.set()
 
     controller.on_log = on_log
     controller.on_stage_changed = on_stage
     controller.on_finished = on_finished
-
     controller.start(manifest_path)
-    done_event.wait()
-
-    result = result_holder[0]
+    done.wait()
+    result: BuildResult = holder[0]
     if result.success:
-        size_mb = result.output_size / (1024 * 1024)
-        print(f"\n✓ Build succeeded in {result.elapsed_seconds:.2f}s")
-        print(f"  Output: {result.output_path} ({size_mb:.1f} MB)")
-        print(f"  Nodes:  {result.node_count:,}")
+        print(f"\n✓ Build succeeded in {result.elapsed_seconds:.1f}s")
+        print(f"  Output:   {result.output_path} ({result.output_size / 1048576:.1f} MiB)")
+        print(f"  SHA-256:  {result.sha256}")
+        print(f"  Packages: {result.package_count}, nodes: {result.node_count:,}")
+        for w in result.warnings:
+            print(f"  ⚠ {w}")
         return 0
-    else:
-        print(f"\n✗ Build failed: {result.error_message}", file=sys.stderr)
-        return 1
+    print(f"\n✗ Build failed: {result.error_message}", file=sys.stderr)
+    return 1
 
 
 def main() -> None:
-    """Parse arguments and dispatch to GUI or CLI mode."""
-    parser = argparse.ArgumentParser(
-        prog="torito",
-        description="Torito — Rootless Linux ISO Compiler",
-        epilog="Run without arguments to launch the GUI.",
-    )
-    parser.add_argument(
-        "manifest",
-        nargs="?",
-        help="Path to a build manifest (.toml / .json / .ini)",
-    )
-    parser.add_argument(
-        "--init",
-        metavar="DIR",
-        help="Scaffold a new distribution project skeleton",
-    )
-    parser.add_argument(
-        "--inspect",
-        metavar="ISO",
-        help="Inspect the binary structures of a bootable ISO image",
-    )
-    parser.add_argument(
-        "--gui",
-        action="store_true",
-        default=False,
-        help="Force GUI mode even when a manifest is provided",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        default=False,
-        help="Enable verbose output in CLI mode",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version="Torito 1.0.0",
-    )
-
+    _utf8_console()
+    parser = argparse.ArgumentParser(prog="torito", description="Torito — rootless Linux ISO compiler",
+                                     epilog="Run without arguments to launch the GUI.")
+    parser.add_argument("manifest", nargs="?", help="build manifest (.toml / .json / .ini)")
+    parser.add_argument("--init", metavar="DIR", help="scaffold a new distribution project")
+    parser.add_argument("--inspect", metavar="ISO", help="print the boot structures of an ISO")
+    parser.add_argument("--verify", metavar="ISO", help="verify an ISO; exit status 1 on problems")
+    parser.add_argument("--gui", action="store_true", help="force GUI mode")
+    parser.add_argument("--keep-work", action="store_true", help="keep the intermediate rootfs.sfs in work_dir")
+    parser.add_argument("-v", "--verbose", action="store_true", help="verbose build telemetry")
+    parser.add_argument("--version", action="version", version=f"Torito {__version__}")
     args = parser.parse_args()
 
     if args.inspect:
         from .inspect import inspect_iso
+
         inspect_iso(args.inspect)
         sys.exit(0)
-    elif args.init:
+    if args.verify:
+        from .inspect import verify_iso
+
+        problems = verify_iso(args.verify)
+        for p in problems:
+            print(f"✗ {p}")
+        if not problems:
+            print("✓ no problems found")
+        sys.exit(1 if problems else 0)
+    if args.init:
         sys.exit(_scaffold_project(args.init))
-    elif args.manifest and not args.gui:
-        # Headless CLI mode
+    if args.manifest and not args.gui:
         if not os.path.isfile(args.manifest):
             print(f"Error: manifest file not found: {args.manifest}", file=sys.stderr)
             sys.exit(1)
-        sys.exit(_cli_build(args.manifest, verbose=args.verbose))
-    else:
-        # GUI mode
-        from .gui import main as gui_main
-        gui_main()
+        sys.exit(_cli_build(args.manifest, verbose=args.verbose, keep_work=args.keep_work))
+    from .gui import main as gui_main
+
+    gui_main()
 
 
 if __name__ == "__main__":
     main()
-

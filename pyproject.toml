@@ -1,11 +1,11 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "torito"
-version = "1.0.0"
-description = "Rootless Linux ISO Compiler — synthesise bootable hybrid BIOS/UEFI Linux ISOs directly on Windows"
+version = "2.0.0"
+description = "Rootless Linux ISO compiler: build bootable BIOS/UEFI hybrid Arch-based live ISOs directly on Windows"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

@@ -1,580 +1,803 @@
 """
 torito.mutations — Rootless State Synthesis
-=============================================
-Deterministically generates ``/etc/passwd``, ``/etc/group``,
-``/etc/shadow`` (SHA-512), and wires init-system service symlinks
-directly inside the VFS — replacing ``chroot``, ``useradd``,
-``systemctl enable``, and ``rc-update add`` entirely.
+===========================================
+Replaces everything a distro build normally does inside a ``chroot``:
+
+* ``/etc/passwd|group|shadow|gshadow`` — merged from the ``filesystem``
+  package, every package's ``sysusers.d`` declarations (what
+  ``systemd-sysusers`` would create) and the manifest's users, with
+  glibc-compatible SHA-512 ``$6$`` password hashes.
+* ``systemctl enable/mask/set-default`` — real ``[Install]`` semantics
+  (WantedBy/RequiredBy/Alias/Also/DefaultInstance, template instances,
+  ``--global`` user units).
+* Package post-install scripts — the effects that matter at build time are
+  emulated; hooks that need Linux binaries (``depmod``,
+  ``glib-compile-schemas``, ``update-mime-database``, ``update-ca-trust``…)
+  are deferred to an early-boot oneshot that runs them inside the target.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-import struct
+import re
+import shlex
 import time
-from typing import List, Optional
+from collections import OrderedDict
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .config import BuildConfig, GroupSpec, ServiceSpec, UserSpec
-from .vfs import PosixVfs
+from .config import BuildConfig, ServiceSpec
+from .vfs import PosixVfs, VfsNodeType
+
+Log = Callable[[str], None]
+
+
+def _nolog(_: str) -> None:
+    pass
 
 
 # ---------------------------------------------------------------------------
-# SHA-512 crypt ($6$) — pure-Python implementation for Windows
+# SHA-512 crypt ($6$) — Ulrich Drepper's algorithm as used by glibc crypt(3)
 # ---------------------------------------------------------------------------
-# Implements the SHA-512 password hashing scheme as specified by
-# Ulrich Drepper's specification (used by glibc crypt(3) with $6$ prefix).
 
 _SHA512_CRYPT_ROUNDS_DEFAULT = 5000
 _SHA512_CRYPT_ROUNDS_MIN = 1000
 _SHA512_CRYPT_ROUNDS_MAX = 999999999
-
 _B64_CHARS = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 
 def _b64_from_24bit(b2: int, b1: int, b0: int, n: int) -> str:
-    """Encode 3 bytes into *n* base-64 characters (crypt-style ordering)."""
     w = (b2 << 16) | (b1 << 8) | b0
-    result = []
+    out = []
     for _ in range(n):
-        result.append(_B64_CHARS[w & 0x3F])
+        out.append(_B64_CHARS[w & 0x3F])
         w >>= 6
-    return "".join(result)
+    return "".join(out)
 
 
 def sha512_crypt(password: str, salt: str, rounds: int = _SHA512_CRYPT_ROUNDS_DEFAULT) -> str:
-    """
-    Compute a ``$6$`` SHA-512 password hash identical to glibc's ``crypt(3)``.
-
-    Parameters
-    ----------
-    password : str
-        The plaintext password.
-    salt : str
-        A salt string (up to 16 characters from ``[./0-9A-Za-z]``).
-    rounds : int
-        Number of hashing rounds (default 5000).
-
-    Returns
-    -------
-    str
-        The full ``$6$...`` hash string suitable for ``/etc/shadow``.
-    """
+    """Compute a ``$6$`` SHA-512 password hash identical to glibc's ``crypt(3)``."""
     rounds = max(_SHA512_CRYPT_ROUNDS_MIN, min(rounds, _SHA512_CRYPT_ROUNDS_MAX))
     salt = salt[:16]
-
     pwd = password.encode("utf-8")
     slt = salt.encode("utf-8")
 
-    # Step 1-3: initial digest B
-    b_ctx = hashlib.sha512()
-    b_ctx.update(pwd)
-    b_ctx.update(slt)
-    b_ctx.update(pwd)
-    digest_b = b_ctx.digest()
-
-    # Step 4-8: initial digest A
+    digest_b = hashlib.sha512(pwd + slt + pwd).digest()
     a_ctx = hashlib.sha512()
     a_ctx.update(pwd)
     a_ctx.update(slt)
-
     plen = len(pwd)
     count = plen
     while count > 64:
         a_ctx.update(digest_b)
         count -= 64
     a_ctx.update(digest_b[:count])
-
-    # Step 9-10: alternating bits of password length
     i = plen
     while i > 0:
-        if i & 1:
-            a_ctx.update(digest_b)
-        else:
-            a_ctx.update(pwd)
+        a_ctx.update(digest_b if i & 1 else pwd)
         i >>= 1
-
     digest_a = a_ctx.digest()
 
-    # Step 11-12: DP = repeated hash of password
     dp_ctx = hashlib.sha512()
     for _ in range(plen):
         dp_ctx.update(pwd)
     digest_dp = dp_ctx.digest()
+    p_bytes = (digest_dp * (plen // 64 + 1))[:plen]
 
-    # Step 13: produce P string
-    p_bytes = b""
-    count = plen
-    while count > 64:
-        p_bytes += digest_dp
-        count -= 64
-    p_bytes += digest_dp[:count]
-
-    # Step 14-15: DS = repeated hash of salt
     ds_ctx = hashlib.sha512()
     for _ in range(16 + digest_a[0]):
         ds_ctx.update(slt)
     digest_ds = ds_ctx.digest()
+    s_bytes = (digest_ds * (len(slt) // 64 + 1))[: len(slt)]
 
-    # Step 16: produce S string
-    s_bytes = b""
-    count = len(slt)
-    while count > 64:
-        s_bytes += digest_ds
-        count -= 64
-    s_bytes += digest_ds[:count]
-
-    # Step 17-20: rounds
     digest_c = digest_a
     for r in range(rounds):
         c_ctx = hashlib.sha512()
-        if r & 1:
-            c_ctx.update(p_bytes)
-        else:
-            c_ctx.update(digest_c)
+        c_ctx.update(p_bytes if r & 1 else digest_c)
         if r % 3:
             c_ctx.update(s_bytes)
         if r % 7:
             c_ctx.update(p_bytes)
-        if r & 1:
-            c_ctx.update(digest_c)
-        else:
-            c_ctx.update(p_bytes)
+        c_ctx.update(digest_c if r & 1 else p_bytes)
         digest_c = c_ctx.digest()
 
-    # Step 21: encode final digest
-    final = digest_c
-    hash_str = (
-        _b64_from_24bit(final[0], final[21], final[42], 4)
-        + _b64_from_24bit(final[22], final[43], final[1], 4)
-        + _b64_from_24bit(final[44], final[2], final[23], 4)
-        + _b64_from_24bit(final[3], final[24], final[45], 4)
-        + _b64_from_24bit(final[25], final[46], final[4], 4)
-        + _b64_from_24bit(final[47], final[5], final[26], 4)
-        + _b64_from_24bit(final[6], final[27], final[48], 4)
-        + _b64_from_24bit(final[28], final[49], final[7], 4)
-        + _b64_from_24bit(final[50], final[8], final[29], 4)
-        + _b64_from_24bit(final[9], final[30], final[51], 4)
-        + _b64_from_24bit(final[31], final[52], final[10], 4)
-        + _b64_from_24bit(final[53], final[11], final[32], 4)
-        + _b64_from_24bit(final[12], final[33], final[54], 4)
-        + _b64_from_24bit(final[34], final[55], final[13], 4)
-        + _b64_from_24bit(final[56], final[14], final[35], 4)
-        + _b64_from_24bit(final[15], final[36], final[57], 4)
-        + _b64_from_24bit(final[37], final[58], final[16], 4)
-        + _b64_from_24bit(final[59], final[17], final[38], 4)
-        + _b64_from_24bit(final[18], final[39], final[60], 4)
-        + _b64_from_24bit(final[40], final[61], final[19], 4)
-        + _b64_from_24bit(final[62], final[20], final[41], 4)
-        + _b64_from_24bit(0, 0, final[63], 2)
-    )
-
+    f = digest_c
+    order = [
+        (0, 21, 42), (22, 43, 1), (44, 2, 23), (3, 24, 45), (25, 46, 4), (47, 5, 26),
+        (6, 27, 48), (28, 49, 7), (50, 8, 29), (9, 30, 51), (31, 52, 10), (53, 11, 32),
+        (12, 33, 54), (34, 55, 13), (56, 14, 35), (15, 36, 57), (37, 58, 16), (59, 17, 38),
+        (18, 39, 60), (40, 61, 19), (62, 20, 41),
+    ]
+    hash_str = "".join(_b64_from_24bit(f[a], f[b], f[c], 4) for a, b, c in order)
+    hash_str += _b64_from_24bit(0, 0, f[63], 2)
     if rounds == _SHA512_CRYPT_ROUNDS_DEFAULT:
         return f"$6${salt}${hash_str}"
     return f"$6$rounds={rounds}${salt}${hash_str}"
 
 
 def _generate_salt(length: int = 16) -> str:
-    """Generate a random salt string for crypt hashing."""
     raw = os.urandom(length)
     return "".join(_B64_CHARS[b % 64] for b in raw)[:length]
 
 
 # ---------------------------------------------------------------------------
-# /etc/passwd, /etc/group, /etc/shadow synthesis
+# Account database
 # ---------------------------------------------------------------------------
 
-# Standard system accounts that every Linux rootfs needs
-_SYSTEM_PASSWD_ENTRIES = [
-    "root:x:0:0:root:/root:/bin/bash",
-    "bin:x:1:1:bin:/bin:/usr/bin/nologin",
-    "daemon:x:2:2:daemon:/:/usr/bin/nologin",
-    "mail:x:8:12:mail:/var/spool/mail:/usr/bin/nologin",
-    "ftp:x:14:11:ftp:/srv/ftp:/usr/bin/nologin",
-    "http:x:33:33:http:/srv/http:/usr/bin/nologin",
+_FALLBACK_PASSWD = [
+    "root:x:0:0::/root:/bin/bash",
+    "bin:x:1:1::/:/usr/bin/nologin",
+    "daemon:x:2:2::/:/usr/bin/nologin",
+    "mail:x:8:12::/var/spool/mail:/usr/bin/nologin",
+    "ftp:x:14:11::/srv/ftp:/usr/bin/nologin",
+    "http:x:33:33::/srv/http:/usr/bin/nologin",
     "nobody:x:65534:65534:Kernel Overflow User:/:/usr/bin/nologin",
-    "dbus:x:81:81:System Message Bus:/:/usr/bin/nologin",
-    "systemd-journal-remote:x:982:982::/:/usr/bin/nologin",
-    "systemd-network:x:981:981::/:/usr/bin/nologin",
-    "systemd-oom:x:980:980::/:/usr/bin/nologin",
-    "systemd-resolve:x:979:979::/:/usr/bin/nologin",
-    "systemd-timesync:x:978:978::/:/usr/bin/nologin",
-    "systemd-coredump:x:977:977::/:/usr/bin/nologin",
-    "polkitd:x:102:102:PolicyKit daemon:/:/usr/bin/nologin",
 ]
-
-_SYSTEM_GROUP_ENTRIES = [
-    "root:x:0:root",
-    "bin:x:1:root,bin,daemon",
-    "daemon:x:2:root,bin,daemon",
-    "sys:x:3:root,bin",
-    "adm:x:4:root,daemon",
-    "tty:x:5:",
-    "disk:x:6:root",
-    "lp:x:7:daemon",
-    "mem:x:8:",
-    "kmem:x:9:",
-    "wheel:x:10:root",
-    "ftp:x:11:",
-    "mail:x:12:",
-    "uucp:x:14:",
-    "log:x:19:root",
-    "utmp:x:20:",
-    "locate:x:21:",
-    "rfkill:x:24:",
-    "smmsp:x:25:",
-    "proc:x:26:",
-    "http:x:33:",
-    "games:x:50:",
-    "lock:x:54:",
-    "uuidd:x:68:",
-    "dbus:x:81:",
-    "network:x:90:",
-    "power:x:98:",
-    "nobody:x:65534:",
-    "users:x:100:",
-    "video:x:985:",
-    "audio:x:986:",
-    "optical:x:987:",
-    "storage:x:988:",
-    "input:x:989:",
-    "scanner:x:990:",
-    "render:x:991:",
-    "sgx:x:992:",
-    "kvm:x:993:",
-    "polkitd:x:102:",
-    "systemd-journal:x:976:",
-    "systemd-journal-remote:x:982:",
-    "systemd-network:x:981:",
-    "systemd-oom:x:980:",
-    "systemd-resolve:x:979:",
-    "systemd-timesync:x:978:",
-    "systemd-coredump:x:977:",
-]
-
-_SYSTEM_SHADOW_ENTRIES = [
-    "root:!:19000:0:99999:7:::",
-    "bin:!*:19000::::::",
-    "daemon:!*:19000::::::",
-    "mail:!*:19000::::::",
-    "ftp:!*:19000::::::",
-    "http:!*:19000::::::",
-    "nobody:!*:19000::::::",
-    "dbus:!*:19000::::::",
-    "systemd-journal-remote:!*:19000::::::",
-    "systemd-network:!*:19000::::::",
-    "systemd-oom:!*:19000::::::",
-    "systemd-resolve:!*:19000::::::",
-    "systemd-timesync:!*:19000::::::",
-    "systemd-coredump:!*:19000::::::",
-    "polkitd:!*:19000::::::",
+_FALLBACK_GROUP = [
+    "root:x:0:root", "sys:x:3:bin", "mem:x:8:", "ftp:x:11:", "mail:x:12:", "log:x:19:",
+    "smmsp:x:25:", "proc:x:26:", "games:x:50:", "lock:x:54:", "network:x:90:",
+    "floppy:x:94:", "scanner:x:96:", "power:x:98:", "adm:x:999:daemon", "wheel:x:998:",
+    "utmp:x:997:", "audio:x:996:", "disk:x:995:", "input:x:994:", "kmem:x:993:",
+    "kvm:x:992:", "lp:x:991:", "optical:x:990:", "render:x:989:", "sgx:x:988:",
+    "storage:x:987:", "tty:x:5:", "uucp:x:986:", "video:x:985:", "users:x:984:",
+    "nobody:x:65534:", "bin:x:1:daemon", "daemon:x:2:bin", "http:x:33:",
 ]
 
 
-def synthesise_users_and_groups(vfs: PosixVfs, config: BuildConfig) -> None:
-    """
-    Generate ``/etc/passwd``, ``/etc/group``, and ``/etc/shadow`` in the VFS.
+class Accounts:
+    """In-memory view of passwd/group/shadow/gshadow with sysusers semantics."""
 
-    Replaces ``chroot useradd``, ``groupadd``, and ``passwd`` entirely.
-    """
-    days_since_epoch = int(time.time()) // 86400
+    SYS_MAX = 999
+    SYS_MIN = 1  # never hand out 0
+    USER_MIN = 1000
 
-    passwd_lines = list(_SYSTEM_PASSWD_ENTRIES)
-    group_lines = list(_SYSTEM_GROUP_ENTRIES)
-    shadow_lines = list(_SYSTEM_SHADOW_ENTRIES)
+    def __init__(self) -> None:
+        self.passwd: "OrderedDict[str, List[str]]" = OrderedDict()
+        self.group: "OrderedDict[str, List[str]]" = OrderedDict()
+        self.shadow: "OrderedDict[str, List[str]]" = OrderedDict()
+        self.gshadow: "OrderedDict[str, List[str]]" = OrderedDict()
 
-    # Existing group names for membership injection
-    group_members: dict[str, List[str]] = {}
-    for gl in group_lines:
-        parts = gl.split(":")
-        name = parts[0]
-        members = parts[3].split(",") if parts[3] else []
-        group_members[name] = members
+    # --- loading ---------------------------------------------------------
+    @staticmethod
+    def _parse(text: Optional[bytes], fields: int) -> "OrderedDict[str, List[str]]":
+        out: "OrderedDict[str, List[str]]" = OrderedDict()
+        if not text:
+            return out
+        for line in text.decode("utf-8", "replace").splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.split(":")
+            parts += [""] * (fields - len(parts))
+            out[parts[0]] = parts[:fields]
+        return out
 
-    # Add custom groups from config
-    for grp in config.groups:
-        entry = f"{grp.name}:x:{grp.gid}:{','.join(grp.members)}"
-        group_lines.append(entry)
-        group_members[grp.name] = list(grp.members)
+    @classmethod
+    def from_vfs(cls, vfs: PosixVfs) -> "Accounts":
+        a = cls()
+        a.passwd = cls._parse(vfs.read_file("/etc/passwd"), 7)
+        a.group = cls._parse(vfs.read_file("/etc/group"), 4)
+        a.shadow = cls._parse(vfs.read_file("/etc/shadow"), 9)
+        a.gshadow = cls._parse(vfs.read_file("/etc/gshadow"), 4)
+        if not a.passwd:
+            for line in _FALLBACK_PASSWD:
+                p = line.split(":")
+                a.passwd[p[0]] = p
+        if not a.group:
+            for line in _FALLBACK_GROUP:
+                g = line.split(":")
+                a.group[g[0]] = g
+        for name in a.passwd:
+            if name not in a.shadow:
+                a.shadow[name] = [name, "!*" if name != "root" else "*", "", "", "", "", "", "", ""]
+        for name, g in a.group.items():
+            if name not in a.gshadow:
+                a.gshadow[name] = [name, "!*", "", g[3]]
+        return a
 
-    # Add custom users from config
-    for user in config.users:
-        gecos = user.gecos if user.gecos else user.name
-        home = user.home_dir()
-        passwd_lines.append(
-            f"{user.name}:x:{user.uid}:{user.gid}:{gecos}:{home}:{user.shell}"
-        )
+    # --- queries ---------------------------------------------------------
+    def uids(self) -> Dict[str, int]:
+        return {n: int(p[2]) for n, p in self.passwd.items() if p[2].isdigit()}
 
-        # Hash the password
-        if user.password:
-            salt = _generate_salt(16)
-            hashed = sha512_crypt(user.password, salt)
-        else:
-            hashed = "!"
+    def gids(self) -> Dict[str, int]:
+        return {n: int(g[2]) for n, g in self.group.items() if g[2].isdigit()}
 
-        shadow_lines.append(
-            f"{user.name}:{hashed}:{days_since_epoch}:0:99999:7:::"
-        )
+    def _used_uids(self) -> set:
+        return set(self.uids().values())
 
-        # Ensure the user's primary group exists
-        primary_gid_exists = any(
-            int(gl.split(":")[2]) == user.gid for gl in group_lines
-        )
-        if not primary_gid_exists:
-            group_lines.append(f"{user.name}:x:{user.gid}:")
-            group_members[user.name] = []
+    def _used_gids(self) -> set:
+        return set(self.gids().values())
 
-        # Add user to supplementary groups
-        for grp_name in user.groups:
-            if grp_name in group_members:
-                if user.name not in group_members[grp_name]:
-                    group_members[grp_name].append(user.name)
+    def _alloc_system(self, want_both: bool) -> int:
+        uu, gg = self._used_uids(), self._used_gids()
+        for i in range(self.SYS_MAX, self.SYS_MIN - 1, -1):
+            if want_both:
+                if i not in uu and i not in gg:
+                    return i
+            elif i not in gg:
+                return i
+        raise RuntimeError("system ID range exhausted")
 
-        # Create home directory
-        vfs.mkdir(home, mode=0o700, uid=user.uid, gid=user.gid)
+    def _alloc_user(self) -> int:
+        uu, gg = self._used_uids(), self._used_gids()
+        i = self.USER_MIN
+        while i in uu or i in gg:
+            i += 1
+        return i
 
-        # Create .bashrc and .bash_profile
-        bashrc_content = (
-            b"# ~/.bashrc\n"
-            b"[[ $- != *i* ]] && return\n"
-            b"alias ls='ls --color=auto'\n"
-            b"PS1='[\\u@\\h \\W]\\$ '\n"
-        )
-        vfs.add_file(f"{home}/.bashrc", bashrc_content, mode=0o644, uid=user.uid, gid=user.gid)
-        vfs.add_file(
-            f"{home}/.bash_profile",
-            b"# ~/.bash_profile\n[[ -f ~/.bashrc ]] && . ~/.bashrc\n",
-            mode=0o644,
-            uid=user.uid,
-            gid=user.gid,
-        )
+    # --- mutation --------------------------------------------------------
+    def add_group(self, name: str, gid: Optional[int] = None, system: bool = True) -> int:
+        if name in self.group:
+            return int(self.group[name][2])
+        if gid is None or gid in self._used_gids():
+            gid = self._alloc_system(False) if system else self._alloc_user()
+        self.group[name] = [name, "x", str(gid), ""]
+        self.gshadow[name] = [name, "!*", "", ""]
+        return gid
 
-    # Rebuild group lines with updated membership
-    rebuilt_groups = []
-    for gl in group_lines:
-        parts = gl.split(":")
-        name = parts[0]
-        if name in group_members:
-            parts[3] = ",".join(group_members[name])
-        rebuilt_groups.append(":".join(parts))
+    def add_member(self, group: str, user: str) -> None:
+        if group not in self.group:
+            self.add_group(group)
+        members = [m for m in self.group[group][3].split(",") if m]
+        if user not in members:
+            members.append(user)
+        self.group[group][3] = ",".join(members)
+        if group in self.gshadow:
+            self.gshadow[group][3] = ",".join(members)
 
-    # Write files to VFS
-    vfs.mkdir("/etc", mode=0o755)
-    vfs.add_file(
-        "/etc/passwd",
-        ("\n".join(passwd_lines) + "\n").encode("utf-8"),
-        mode=0o644,
-    )
-    vfs.add_file(
-        "/etc/group",
-        ("\n".join(rebuilt_groups) + "\n").encode("utf-8"),
-        mode=0o644,
-    )
-    vfs.add_file(
-        "/etc/shadow",
-        ("\n".join(shadow_lines) + "\n").encode("utf-8"),
-        mode=0o000,
-    )
-    # gshadow
-    gshadow_lines = []
-    for gl in rebuilt_groups:
-        parts = gl.split(":")
-        gshadow_lines.append(f"{parts[0]}:!::{parts[3]}")
-    vfs.add_file(
-        "/etc/gshadow",
-        ("\n".join(gshadow_lines) + "\n").encode("utf-8"),
-        mode=0o000,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Init system service wiring
-# ---------------------------------------------------------------------------
-
-
-def _enable_systemd_service(vfs: PosixVfs, svc: ServiceSpec) -> None:
-    """
-    Wire a systemd service by creating the appropriate ``*.wants/`` symlink.
-
-    Equivalent to ``systemctl enable <service>`` inside a chroot.
-    """
-    service_filename = svc.name if svc.name.endswith(".service") else f"{svc.name}.service"
-    target = svc.target if svc.target else "multi-user.target"
-
-    wants_dir = f"/etc/systemd/system/{target}.wants"
-    vfs.mkdir(wants_dir, mode=0o755)
-
-    link_path = f"{wants_dir}/{service_filename}"
-    unit_target = f"/usr/lib/systemd/system/{service_filename}"
-
-    # If the unit file exists in the VFS, parse its [Install] section
-    unit_node = vfs.get(unit_target)
-    if unit_node is not None and unit_node.data:
-        wanted_by = _parse_systemd_wanted_by(unit_node.data.decode("utf-8", errors="replace"))
-        if wanted_by:
-            # The unit file may specify different targets
-            for wb_target in wanted_by:
-                wb_dir = f"/etc/systemd/system/{wb_target}.wants"
-                vfs.mkdir(wb_dir, mode=0o755)
-                vfs.add_symlink(f"{wb_dir}/{service_filename}", unit_target)
+    def add_system_user(self, name: str, uid_spec: str, gecos: str, home: str, shell: str) -> None:
+        if name in self.passwd:
             return
+        uid: Optional[int] = None
+        gid: Optional[int] = None
+        group_name = name
+        if uid_spec and uid_spec != "-" and not uid_spec.startswith("/"):
+            if ":" in uid_spec:
+                u, g = uid_spec.split(":", 1)
+                uid = int(u) if u.isdigit() else None
+                if g.isdigit():
+                    gid = int(g)
+                else:
+                    group_name = g
+            elif uid_spec.isdigit():
+                uid = int(uid_spec)
+        if uid is not None and uid in self._used_uids():
+            uid = None
+        if uid is None:
+            want = int(self.group[group_name][2]) if group_name in self.group else None
+            uid = want if (want is not None and want not in self._used_uids()) else self._alloc_system(group_name not in self.group)
+        if group_name in self.group:
+            gid = int(self.group[group_name][2])
+        else:
+            gid = self.add_group(group_name, gid if gid is not None else uid)
+        self.passwd[name] = [name, "x", str(uid), str(gid), gecos, home or "/", shell or "/usr/bin/nologin"]
+        self.shadow[name] = [name, "!*", "", "", "", "", "", "", ""]
 
-    vfs.add_symlink(link_path, unit_target)
+    def apply_sysusers(self, text: str, log: Log = _nolog) -> None:
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                toks = shlex.split(line)
+            except ValueError:
+                continue
+            if len(toks) < 2:
+                continue
+            kind, name = toks[0].rstrip("!"), toks[1]
+            arg = toks[2] if len(toks) > 2 else "-"
+            if kind == "g":
+                gid = int(arg) if arg.isdigit() else None
+                self.add_group(name, gid)
+            elif kind == "u":
+                gecos = toks[3] if len(toks) > 3 and toks[3] != "-" else ""
+                home = toks[4] if len(toks) > 4 and toks[4] != "-" else "/"
+                shell = toks[5] if len(toks) > 5 and toks[5] != "-" else "/usr/bin/nologin"
+                self.add_system_user(name, arg, gecos, home, shell)
+            elif kind == "m":
+                if name in self.passwd:
+                    self.add_member(arg, name)
+            # 'r' (ranges) only constrains allocation; our defaults already match.
+
+    def set_password(self, user: str, password: Optional[str], last_change: int) -> None:
+        if password is None:
+            hashed = "!*"
+        elif password == "":
+            hashed = ""
+        elif password.startswith("$"):
+            hashed = password  # already hashed
+        else:
+            hashed = sha512_crypt(password, _generate_salt(16))
+        self.shadow[user] = [user, hashed, str(last_change), "0", "99999", "7", "", "", ""]
+
+    # --- output ----------------------------------------------------------
+    def write(self, vfs: PosixVfs) -> None:
+        def dump(d: "OrderedDict[str, List[str]]") -> bytes:
+            return ("\n".join(":".join(v) for v in d.values()) + "\n").encode("utf-8")
+
+        vfs.add_file("/etc/passwd", dump(self.passwd), mode=0o644)
+        vfs.add_file("/etc/group", dump(self.group), mode=0o644)
+        vfs.add_file("/etc/shadow", dump(self.shadow), mode=0o600)
+        vfs.add_file("/etc/gshadow", dump(self.gshadow), mode=0o600)
+
+
+def _sysusers_files(vfs: PosixVfs) -> List[Tuple[str, bytes]]:
+    chosen: Dict[str, bytes] = {}
+    for d in ("/usr/lib/sysusers.d", "/etc/sysusers.d"):
+        for name in vfs.list_dir(d):
+            if name.endswith(".conf"):
+                data = vfs.read_file(f"{d}/{name}")
+                if data is not None:
+                    chosen[name] = data  # /etc overrides /usr/lib
+    return sorted(chosen.items())
+
+
+def synthesise_users_and_groups(vfs: PosixVfs, config: BuildConfig, log: Log = _nolog) -> Accounts:
+    """Build the account database and home directories. Returns the result."""
+    acc = Accounts.from_vfs(vfs)
+    for name, data in _sysusers_files(vfs):
+        acc.apply_sysusers(data.decode("utf-8", "replace"), log)
+
+    days = int(time.time()) // 86400
+
+    for grp in config.groups:
+        acc.add_group(grp.name, grp.gid, system=grp.gid is not None and grp.gid < 1000)
+        if grp.gid is not None and acc.group[grp.name][2] != str(grp.gid):
+            acc.group[grp.name][2] = str(grp.gid)
+        for m in grp.members:
+            if m in acc.passwd or any(u.name == m for u in config.users):
+                pass  # membership added after users exist
+
+    for user in config.users:
+        home = user.home_dir()
+        if user.name in acc.passwd:
+            entry = acc.passwd[user.name]
+            if user.uid is not None:
+                entry[2] = str(user.uid)
+            if user.gid is not None:
+                entry[3] = str(user.gid)
+            entry[5] = home if user.home else entry[5]
+            entry[6] = user.shell or entry[6]
+            if user.gecos:
+                entry[4] = user.gecos
+        else:
+            uid = user.uid if user.uid is not None else acc._alloc_user()
+            if user.gid is not None:
+                gid = user.gid
+                existing = [n for n, g in acc.group.items() if g[2] == str(gid)]
+                if not existing:
+                    acc.add_group(user.name, gid, system=False)
+            else:
+                gid = acc.add_group(user.name, uid, system=False)
+            acc.passwd[user.name] = [user.name, "x", str(uid), str(gid), user.gecos, home, user.shell]
+        acc.set_password(user.name, user.password, days)
+        for g in user.groups:
+            acc.add_member(g, user.name)
+
+    for grp in config.groups:
+        for m in grp.members:
+            if m in acc.passwd:
+                acc.add_member(grp.name, m)
+
+    acc.write(vfs)
+
+    # Home directories with /etc/skel contents.
+    uids, gids = acc.uids(), acc.gids()
+    for user in config.users:
+        if not user.create_home:
+            continue
+        entry = acc.passwd[user.name]
+        uid, gid, home = int(entry[2]), int(entry[3]), entry[5]
+        if not home or home == "/":
+            continue
+        vfs.mkdir(home, mode=0o700 if user.name != "root" else 0o750, uid=uid, gid=gid)
+        for path, node in list(vfs.iter_subtree("/etc/skel")):
+            rel = path[len("/etc/skel"):]
+            if not rel:
+                continue
+            dest = home.rstrip("/") + rel
+            if vfs.exists(dest):
+                continue
+            if node.node_type == VfsNodeType.DIRECTORY:
+                vfs.mkdir(dest, mode=node.mode, uid=uid, gid=gid)
+            elif node.node_type == VfsNodeType.REGULAR_FILE:
+                vfs.add_file(dest, node.data, mode=node.mode, uid=uid, gid=gid)
+            elif node.node_type == VfsNodeType.SYMLINK:
+                vfs.add_symlink(dest, node.link_target, uid=uid, gid=gid)
+        # Anything an overlay already put in the home belongs to the user.
+        for path, node in vfs.iter_subtree(home):
+            node.uid, node.gid = uid, gid
+            node.uname = node.gname = ""
+    log(f"  accounts: {len(acc.passwd)} users, {len(acc.group)} groups")
+    return acc
+
+
+# ---------------------------------------------------------------------------
+# systemd unit enablement
+# ---------------------------------------------------------------------------
+
+SYSTEM_UNIT_DIRS = ["/etc/systemd/system", "/usr/lib/systemd/system"]
+USER_UNIT_DIRS = ["/etc/systemd/user", "/usr/lib/systemd/user"]
+_UNIT_SUFFIXES = (".service", ".socket", ".target", ".timer", ".path", ".mount", ".automount", ".swap", ".slice", ".scope", ".device")
+
+
+def _unit_name(name: str) -> str:
+    return name if name.endswith(_UNIT_SUFFIXES) else name + ".service"
+
+
+def _split_instance(unit: str) -> Tuple[str, str, str]:
+    """``getty@tty1.service`` → (``getty@.service``, ``tty1``, ``.service``)."""
+    base, dot, suffix = unit.rpartition(".")
+    if "@" in base:
+        prefix, inst = base.split("@", 1)
+        return f"{prefix}@.{suffix}", inst, "." + suffix
+    return unit, "", "." + suffix
+
+
+def _find_unit(vfs: PosixVfs, unit: str, dirs: Sequence[str]) -> Optional[str]:
+    for d in dirs:
+        p = f"{d}/{unit}"
+        if vfs.lookup(p) is not None:
+            return p
+    return None
+
+
+def parse_install_section(text: str) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        if section != "Install" or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out.setdefault(k.strip(), []).extend(v.split())
+    return out
 
 
 def _parse_systemd_wanted_by(unit_content: str) -> List[str]:
-    """Extract ``WantedBy=`` values from a systemd unit file."""
-    results = []
-    in_install = False
-    for line in unit_content.splitlines():
-        stripped = line.strip()
-        if stripped == "[Install]":
-            in_install = True
-            continue
-        if stripped.startswith("[") and in_install:
-            break
-        if in_install and stripped.startswith("WantedBy="):
-            values = stripped[len("WantedBy="):].strip()
-            results.extend(v.strip() for v in values.split() if v.strip())
-    return results
+    """Backwards-compatible helper: WantedBy= targets of a unit."""
+    return parse_install_section(unit_content).get("WantedBy", [])
+
+
+def enable_systemd_unit(
+    vfs: PosixVfs,
+    name: str,
+    user: bool = False,
+    target_override: str = "",
+    log: Log = _nolog,
+    _seen: Optional[set] = None,
+) -> bool:
+    """Equivalent of ``systemctl [--global] enable <name>``. Returns success."""
+    seen = _seen if _seen is not None else set()
+    unit = _unit_name(name)
+    if unit in seen:
+        return True
+    seen.add(unit)
+    dirs = USER_UNIT_DIRS if user else SYSTEM_UNIT_DIRS
+    etc_dir = dirs[0]
+    template, instance, _ = _split_instance(unit)
+    path = _find_unit(vfs, unit, dirs) or (_find_unit(vfs, template, dirs) if instance or "@" in unit else None)
+    if path is None:
+        log(f"  ⚠ cannot enable {unit}: unit file not found")
+        return False
+    node = vfs.lookup(path)
+    text = node.data.decode("utf-8", "replace") if node is not None else ""
+    # Drop-ins can extend [Install]? (No — systemd ignores [Install] in drop-ins.)
+    inst = parse_install_section(text)
+    real_target = vfs.resolve(path, follow_last=True)
+    if "@" in unit and not instance:
+        default_inst = (inst.get("DefaultInstance") or [""])[0]
+        if default_inst:
+            unit = template.replace("@.", f"@{default_inst}.")
+            instance = default_inst
+
+    def subst(s: str) -> str:
+        return s.replace("%i", instance).replace("%I", instance).replace("%n", unit).replace("%N", unit.rsplit(".", 1)[0])
+
+    targets: List[Tuple[str, str]] = []
+    if target_override:
+        targets.append((target_override, "wants"))
+    else:
+        targets += [(t, "wants") for t in inst.get("WantedBy", [])]
+        targets += [(t, "requires") for t in inst.get("RequiredBy", [])]
+        targets += [(t, "upholds") for t in inst.get("UpheldBy", [])]
+    aliases = [subst(a) for a in inst.get("Alias", [])]
+    also = [subst(a) for a in inst.get("Also", [])]
+    if not targets and not aliases and not also:
+        log(f"  ⚠ {unit} has no [Install] section (static unit); nothing to enable")
+        return False
+    for tgt, kind in targets:
+        d = f"{etc_dir}/{subst(tgt)}.{kind}"
+        vfs.mkdir(d)
+        vfs.add_symlink(f"{d}/{unit}", real_target)
+    for a in aliases:
+        vfs.mkdir(etc_dir)
+        vfs.add_symlink(f"{etc_dir}/{a}", real_target)
+    for a in also:
+        enable_systemd_unit(vfs, a, user=user, log=log, _seen=seen)
+    return True
+
+
+def mask_systemd_unit(vfs: PosixVfs, name: str, user: bool = False) -> None:
+    etc_dir = (USER_UNIT_DIRS if user else SYSTEM_UNIT_DIRS)[0]
+    vfs.mkdir(etc_dir)
+    vfs.add_symlink(f"{etc_dir}/{_unit_name(name)}", "/dev/null")
+
+
+def set_default_target(vfs: PosixVfs, target: str) -> None:
+    t = _unit_name(target) if target.endswith(".target") else target + ".target"
+    path = _find_unit(vfs, t, SYSTEM_UNIT_DIRS) or f"/usr/lib/systemd/system/{t}"
+    vfs.mkdir("/etc/systemd/system")
+    vfs.add_symlink("/etc/systemd/system/default.target", vfs.resolve(path, follow_last=True))
 
 
 def _enable_openrc_service(vfs: PosixVfs, svc: ServiceSpec) -> None:
-    """
-    Wire an OpenRC service by creating the appropriate symlink in
-    ``/etc/runlevels/<runlevel>/``.
-
-    Equivalent to ``rc-update add <service> <runlevel>``.
-    """
-    runlevel = svc.runlevel if svc.runlevel else "default"
-    svc_name = svc.name.replace(".service", "")
-
-    runlevel_dir = f"/etc/runlevels/{runlevel}"
-    vfs.mkdir(runlevel_dir, mode=0o755)
-
-    init_script = f"/etc/init.d/{svc_name}"
-    link_path = f"{runlevel_dir}/{svc_name}"
-    vfs.add_symlink(link_path, init_script)
+    name = svc.name.replace(".service", "")
+    rl = svc.runlevel or "default"
+    vfs.mkdir(f"/etc/runlevels/{rl}")
+    vfs.add_symlink(f"/etc/runlevels/{rl}/{name}", f"/etc/init.d/{name}")
 
 
 def _enable_runit_service(vfs: PosixVfs, svc: ServiceSpec) -> None:
-    """
-    Wire a runit service by creating the appropriate symlink in
-    ``/var/service/`` pointing to ``/etc/sv/<service>/``.
-
-    Equivalent to ``ln -s /etc/sv/<service> /var/service/``.
-    """
-    svc_name = svc.name.replace(".service", "")
-    sv_dir = f"/etc/sv/{svc_name}"
-    service_link = f"/var/service/{svc_name}"
-
-    vfs.mkdir("/var/service", mode=0o755)
-    vfs.add_symlink(service_link, sv_dir)
+    name = svc.name.replace(".service", "")
+    vfs.mkdir("/var/service")
+    vfs.add_symlink(f"/var/service/{name}", f"/etc/sv/{name}")
 
 
-def wire_services(vfs: PosixVfs, config: BuildConfig) -> None:
-    """Enable all services specified in the build configuration."""
+def wire_services(vfs: PosixVfs, config: BuildConfig, log: Log = _nolog) -> None:
     for svc in config.services:
         if svc.init_system == "systemd":
-            _enable_systemd_service(vfs, svc)
+            if svc.mask:
+                mask_systemd_unit(vfs, svc.name, user=svc.user)
+            else:
+                enable_systemd_unit(vfs, svc.name, user=svc.user, target_override=svc.target, log=log)
         elif svc.init_system == "openrc":
             _enable_openrc_service(vfs, svc)
         elif svc.init_system == "runit":
             _enable_runit_service(vfs, svc)
         else:
             raise ValueError(f"Unknown init system: {svc.init_system!r}")
+    if config.default_target:
+        set_default_target(vfs, config.default_target)
 
 
 # ---------------------------------------------------------------------------
-# System configuration synthesis
+# Package install-script emulation & deferred hooks
+# ---------------------------------------------------------------------------
+
+# Effects of well-known .INSTALL scripts that must exist before first boot.
+_INSTALL_EMULATION: Dict[str, List[Tuple[str, str]]] = {
+    "systemd": [("enable", "getty@tty1.service"), ("enable", "remote-fs.target")],
+}
+
+DEFERRED_HOOKS_SCRIPT = r"""#!/bin/sh
+# Generated by Torito: package hooks that need the target's own binaries.
+# Runs once per boot of the live image (state lives in the overlay), early,
+# before udev and the display manager.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+log() { echo "torito-hooks: $*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+for kdir in /usr/lib/modules/*/; do
+    kver=$(basename "$kdir")
+    if [ ! -e "$kdir/modules.dep.bin" ] && have depmod; then
+        log "depmod $kver"; depmod -a "$kver"
+    fi
+done
+if [ -s /etc/locale.gen ] && have locale-gen && grep -q '^[^#]' /etc/locale.gen && [ ! -e /usr/lib/locale/locale-archive ]; then
+    log "locale-gen"; locale-gen >/dev/null
+fi
+have ldconfig && ldconfig
+[ -d /usr/share/glib-2.0/schemas ] && have glib-compile-schemas && glib-compile-schemas /usr/share/glib-2.0/schemas
+[ -d /usr/lib/gio/modules ] && have gio-querymodules && gio-querymodules /usr/lib/gio/modules
+for d in /usr/lib/gdk-pixbuf-2.0/*/loaders; do
+    [ -d "$d" ] && have gdk-pixbuf-query-loaders && gdk-pixbuf-query-loaders --update-cache
+    break
+done
+[ -d /usr/share/mime ] && have update-mime-database && update-mime-database /usr/share/mime
+[ -d /usr/share/applications ] && have update-desktop-database && update-desktop-database -q /usr/share/applications
+have update-ca-trust && update-ca-trust extract
+have systemd-hwdb && [ ! -e /etc/udev/hwdb.bin ] && [ ! -e /usr/lib/udev/hwdb.bin ] && systemd-hwdb update
+have dconf && [ -d /etc/dconf/db ] && dconf update
+exit 0
+"""
+
+DEFERRED_LATE_SCRIPT = r"""#!/bin/sh
+# Generated by Torito: slow, non-critical hooks run in the background.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+have() { command -v "$1" >/dev/null 2>&1; }
+have fc-cache && fc-cache -s
+for d in /usr/share/icons/*/; do
+    [ -f "$d/index.theme" ] && have gtk-update-icon-cache && gtk-update-icon-cache -q -t -f "$d"
+done
+if have pacman-key && [ ! -f /etc/pacman.d/gnupg/trustdb.gpg ]; then
+    pacman-key --init && pacman-key --populate
+fi
+exit 0
+"""
+
+DEFERRED_HOOKS_UNIT = """[Unit]
+Description=Torito deferred package hooks
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target systemd-udevd.service systemd-udev-trigger.service systemd-modules-load.service kmod-static-nodes.service systemd-tmpfiles-setup-dev-early.service
+ConditionPathExists=!/run/torito-hooks.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/torito/torito-hooks
+ExecStartPost=/usr/bin/touch /run/torito-hooks.done
+RemainAfterExit=yes
+StandardOutput=journal+console
+
+[Install]
+WantedBy=sysinit.target
+"""
+
+DEFERRED_LATE_UNIT = """[Unit]
+Description=Torito deferred background hooks (fonts, icons, pacman keyring)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/lib/torito/torito-hooks-late
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def emulate_install_scripts(vfs: PosixVfs, installed: Iterable[str], scripts: Dict[str, bytes], log: Log = _nolog) -> None:
+    names = set(installed)
+    for pkg, actions in _INSTALL_EMULATION.items():
+        if pkg not in names:
+            continue
+        for action, arg in actions:
+            if action == "enable":
+                enable_systemd_unit(vfs, arg, log=log)
+    with_scripts = sorted(n for n, s in scripts.items() if s and n not in _INSTALL_EMULATION)
+    if with_scripts:
+        log(f"  install scriptlets deferred/skipped for {len(with_scripts)} packages")
+
+
+def install_deferred_hooks(vfs: PosixVfs, log: Log = _nolog) -> None:
+    if not vfs.is_dir("/usr/lib/systemd/system"):
+        return
+    vfs.mkdir("/usr/lib/torito")
+    vfs.add_file("/usr/lib/torito/torito-hooks", DEFERRED_HOOKS_SCRIPT.encode(), mode=0o755)
+    vfs.add_file("/usr/lib/torito/torito-hooks-late", DEFERRED_LATE_SCRIPT.encode(), mode=0o755)
+    vfs.add_file("/usr/lib/systemd/system/torito-hooks.service", DEFERRED_HOOKS_UNIT.encode())
+    vfs.add_file("/usr/lib/systemd/system/torito-hooks-late.service", DEFERRED_LATE_UNIT.encode())
+    enable_systemd_unit(vfs, "torito-hooks.service", log=log)
+    enable_systemd_unit(vfs, "torito-hooks-late.service", log=log)
+    # hwdb.bin is compiled at first boot (systemd-hwdb-update.service), which
+    # runs after generators; the cloud IMDS generator needs it and would log a
+    # spurious failure on every boot.  Mask it (meaningless on live media).
+    gen = "/usr/lib/systemd/system-generators/systemd-imds-generator"
+    if vfs.lookup(gen) is not None and vfs.lookup("/usr/lib/udev/hwdb.bin") is None:
+        vfs.mkdir("/etc/systemd/system-generators")
+        vfs.add_symlink("/etc/systemd/system-generators/systemd-imds-generator", "/dev/null")
+
+
+# ---------------------------------------------------------------------------
+# System configuration
 # ---------------------------------------------------------------------------
 
 
-def synthesise_system_config(vfs: PosixVfs, config: BuildConfig) -> None:
-    """
-    Generate standard system configuration files:
-    ``/etc/hostname``, ``/etc/hosts``, ``/etc/locale.conf``,
-    ``/etc/vconsole.conf``, ``/etc/localtime``, ``/etc/os-release``,
-    ``/etc/machine-id``, and ``/etc/fstab``.
-    """
-    vfs.mkdir("/etc", mode=0o755)
-
-    # /etc/hostname
+def synthesise_system_config(vfs: PosixVfs, config: BuildConfig, log: Log = _nolog) -> None:
+    vfs.mkdir("/etc")
+    vfs.add_file("/etc/hostname", (config.hostname + "\n").encode())
     vfs.add_file(
-        "/etc/hostname",
-        (config.hostname + "\n").encode("utf-8"),
-        mode=0o644,
+        "/etc/hosts",
+        (
+            "127.0.0.1   localhost\n"
+            "::1         localhost\n"
+            f"127.0.1.1   {config.hostname}.localdomain {config.hostname}\n"
+        ).encode(),
     )
+    vfs.add_file("/etc/locale.conf", f"LANG={config.locale}\n".encode())
+    vfs.add_file("/etc/vconsole.conf", f"KEYMAP={config.keymap}\n".encode())
+    zone = f"/usr/share/zoneinfo/{config.timezone}"
+    vfs.add_symlink("/etc/localtime", ".." + zone)
 
-    # /etc/hosts
-    hosts = (
-        f"127.0.0.1   localhost\n"
-        f"::1         localhost\n"
-        f"127.0.1.1   {config.hostname}.localdomain {config.hostname}\n"
-    )
-    vfs.add_file("/etc/hosts", hosts.encode("utf-8"), mode=0o644)
+    # locale.gen: uncomment the requested locale in glibc's template.
+    loc = config.locale
+    charset = loc.split(".", 1)[1] if "." in loc else "UTF-8"
+    wanted = f"{loc} {charset}"
+    existing = vfs.read_file("/etc/locale.gen")
+    if existing:
+        lines = existing.decode("utf-8", "replace").splitlines()
+        found = False
+        for i, line in enumerate(lines):
+            if line.lstrip("#").strip() == wanted:
+                lines[i] = wanted
+                found = True
+        if not found:
+            lines.append(wanted)
+        vfs.add_file("/etc/locale.gen", ("\n".join(lines) + "\n").encode())
+    else:
+        vfs.add_file("/etc/locale.gen", (wanted + "\n").encode())
 
-    # /etc/locale.conf
-    vfs.add_file(
-        "/etc/locale.conf",
-        f"LANG={config.locale}\n".encode("utf-8"),
-        mode=0o644,
-    )
+    # os-release: keep an overlay-provided regular file, else generate one.
+    node = vfs.get("/etc/os-release")
+    if node is None or node.node_type != VfsNodeType.REGULAR_FILE or config.os_release:
+        slug = re.sub(r"[^a-z0-9._-]", "-", config.name.lower())
+        fields = OrderedDict(
+            [
+                ("NAME", config.name),
+                ("PRETTY_NAME", f"{config.name} {config.version}"),
+                ("ID", slug),
+                ("VERSION", config.version),
+                ("VERSION_ID", config.version),
+                ("BUILD_ID", config.version),
+            ]
+        )
+        if vfs.exists("/var/lib/pacman/local"):
+            fields["ID_LIKE"] = "arch"
+        fields.update(config.os_release)
+        text = "".join(f'{k}="{v}"\n' for k, v in fields.items())
+        vfs.add_file("/usr/lib/os-release", text.encode())
+        vfs.add_symlink("/etc/os-release", "../usr/lib/os-release")
 
-    # /etc/vconsole.conf
-    vfs.add_file(
-        "/etc/vconsole.conf",
-        f"KEYMAP={config.keymap}\n".encode("utf-8"),
-        mode=0o644,
-    )
-
-    # /etc/localtime -> timezone symlink
-    vfs.add_symlink(
-        "/etc/localtime",
-        f"/usr/share/zoneinfo/{config.timezone}",
-    )
-
-    # /etc/os-release
-    os_release = (
-        f'NAME="{config.name}"\n'
-        f'VERSION="{config.version}"\n'
-        f'ID={config.name.lower().replace(" ", "-")}\n'
-        f'VERSION_ID="{config.version}"\n'
-        f'PRETTY_NAME="{config.name} {config.version}"\n'
-        f'HOME_URL="https://github.com/DeadFromInside-skibidi/torito"\n'
-        f'BUILD_ID="{config.version}"\n'
-    )
-    vfs.add_file("/etc/os-release", os_release.encode("utf-8"), mode=0o644)
-
-    # /etc/machine-id (empty for first-boot generation)
+    # machine-id: empty → systemd treats the boot as first boot and generates one.
     vfs.add_file("/etc/machine-id", b"", mode=0o444)
-
-    # /etc/fstab (minimal live ISO fstab)
-    fstab = (
-        "# /etc/fstab - Torito live ISO\n"
-        "# <file system>  <mount point>  <type>  <options>  <dump>  <pass>\n"
-        "tmpfs            /tmp           tmpfs   defaults,nosuid,nodev  0  0\n"
-        "tmpfs            /run           tmpfs   defaults,nosuid,nodev,mode=0755  0  0\n"
-    )
-    vfs.add_file("/etc/fstab", fstab.encode("utf-8"), mode=0o644)
-
-    # /etc/locale.gen
-    vfs.add_file(
-        "/etc/locale.gen",
-        f"{config.locale} UTF-8\n".encode("utf-8"),
-        mode=0o644,
-    )
+    if not vfs.exists("/etc/fstab"):
+        vfs.add_file("/etc/fstab", b"# /etc/fstab: static file system information (live system)\n")
 
 
-def apply_all_mutations(vfs: PosixVfs, config: BuildConfig) -> None:
+def apply_file_permissions(vfs: PosixVfs, perms: Dict[str, str], acc: Optional[Accounts], log: Log = _nolog) -> None:
+    uids = acc.uids() if acc else {"root": 0}
+    gids = acc.gids() if acc else {"root": 0}
+    for path, spec in perms.items():
+        parts = spec.split(":")
+        if len(parts) != 3:
+            log(f"  ⚠ bad permission spec for {path}: {spec}")
+            continue
+        u, g, m = parts
+        node = vfs.lookup(path)
+        if node is None:
+            log(f"  ⚠ file_permissions: {path} does not exist")
+            continue
+        node.uid = int(u) if u.isdigit() else uids.get(u, 0)
+        node.gid = int(g) if g.isdigit() else gids.get(g, 0)
+        node.uname = node.gname = ""
+        node.mode = int(m, 8)
+
+
+def remove_paths(vfs: PosixVfs, patterns: Sequence[str], log: Log = _nolog) -> int:
+    import fnmatch
+
+    removed = 0
+    for pat in patterns:
+        if any(ch in pat for ch in "*?["):
+            base = pat.split("*", 1)[0].rsplit("/", 1)[0] or "/"
+            for p, _ in list(vfs.iter_subtree(base)):
+                if fnmatch.fnmatch(p, pat) and vfs.exists(p):
+                    vfs.remove(p)
+                    removed += 1
+        elif vfs.exists(pat):
+            vfs.remove(pat)
+            removed += 1
+    if removed:
+        log(f"  removed {removed} paths")
+    return removed
+
+
+def apply_all_mutations(vfs: PosixVfs, config: BuildConfig, log: Log = _nolog) -> Accounts:
     """
-    Run every rootless mutation step in the correct order:
-
-    1. System configuration files
-    2. Users and groups
-    3. Service wiring
+    System config → accounts → owner resolution → services → permissions.
+    Returns the final account database.
     """
-    synthesise_system_config(vfs, config)
-    synthesise_users_and_groups(vfs, config)
-    wire_services(vfs, config)
-
+    synthesise_system_config(vfs, config, log)
+    acc = synthesise_users_and_groups(vfs, config, log)
+    vfs.resolve_owners(acc.uids(), acc.gids(), log)
+    wire_services(vfs, config, log)
+    apply_file_permissions(vfs, config.file_permissions, acc, log)
+    return acc

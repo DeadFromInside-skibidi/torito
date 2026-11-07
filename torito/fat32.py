@@ -1091,21 +1091,20 @@ def build_efi_esp(
     bytes
         Complete FAT32 disk image suitable for writing to efiboot.img.
     """
-    extra_size = sum(len(v) for v in extra_files.values()) if extra_files else 0
-    payload_size = len(efi_binary) + len(kernel) + len(initramfs) + extra_size
-    # Reserve 1 MB for filesystem metadata (BPB, FAT tables, directory clusters)
-    min_size_mb = math.ceil((payload_size + 1024 * 1024) / (1024 * 1024))
-    effective_mb = max(size_mb, min_size_mb)
-    size_bytes = effective_mb * 1024 * 1024
+    # Delegates to the one-shot builder, which picks FAT16/FAT32 by cluster
+    # count exactly like UEFI firmware does (a small "FAT32" ESP is read as
+    # FAT16 by firmware and fails to boot).
+    from .fatfs import build_fat_image
 
-    img = Fat32Image(size_bytes=size_bytes, volume_label=volume_label)
-    img.create_directory("/EFI/BOOT")
-    img.write_file("/EFI/BOOT/BOOTX64.EFI", efi_binary)
+    files: Dict[str, bytes] = {}
+    if efi_binary:
+        files["/EFI/BOOT/BOOTX64.EFI"] = efi_binary
     if kernel:
-        img.write_file("/vmlinuz", kernel)
+        files["/vmlinuz"] = kernel
     if initramfs:
-        img.write_file("/initramfs.img", initramfs)
-    if extra_files:
-        for fpath, fdata in extra_files.items():
-            img.write_file(fpath, fdata)
-    return img.to_bytes()
+        files["/initramfs.img"] = initramfs
+    for fpath, fdata in (extra_files or {}).items():
+        files[fpath] = fdata
+    if not files:
+        files["/EFI/BOOT/.keep"] = b""
+    return build_fat_image(files, label=volume_label[:11], min_size=size_mb * 1024 * 1024 if size_mb else 0)
