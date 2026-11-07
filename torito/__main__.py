@@ -140,6 +140,11 @@ def main() -> None:
         help="Scaffold a new distribution project skeleton",
     )
     parser.add_argument(
+        "--inspect",
+        metavar="ISO",
+        help="Inspect the binary structures of a bootable ISO image",
+    )
+    parser.add_argument(
         "--gui",
         action="store_true",
         default=False,
@@ -159,7 +164,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.init:
+    if args.inspect:
+        from .inspect import inspect_iso
+        inspect_iso(args.inspect)
+        sys.exit(0)
+    elif args.init:
         sys.exit(_scaffold_project(args.init))
     elif args.manifest and not args.gui:
         # Headless CLI mode
