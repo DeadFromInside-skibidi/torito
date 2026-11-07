@@ -475,6 +475,127 @@ squashfs_level = 1
             self.assertIn("torito.label=E2E_LIVE", fh.read(ln).decode())
 
 
+class TestSmartDefaults(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _load(self, text: str) -> BuildConfig:
+        p = os.path.join(self.tmp, "d.toml")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        return load_config(p)
+
+    def test_kernel_and_base_added(self):
+        cfg = self._load('name = "My Cool Distro"\npackages = ["nano"]\n')
+        self.assertEqual(cfg.package_names, ["base", "nano", "linux"])
+        self.assertEqual(cfg.hostname, "my-cool-distro")
+        self.assertTrue(cfg.iso.output_path.replace("\\", "/").endswith("output/my-cool-distro-x86_64.iso"))
+        self.assertEqual(cfg.iso.volume_id, "MY_COOL_DISTRO_LIVE")
+        self.assertEqual(len([n for n in cfg.notes if n.startswith("added")]), 2)
+        cfg = self._load('name = "X"\n')  # no packages at all still gives a bootable system
+        self.assertEqual(cfg.package_names, ["base", "linux"])
+        # …that someone can log in to.
+        self.assertEqual([(u.name, u.password) for u in cfg.users], [("root", "")])
+        cfg = self._load('name = "X"\npackages = ["base", "linux-lts"]\n[[users]]\nname = "me"\n')
+        self.assertEqual(cfg.package_names, ["base", "linux-lts"])
+        self.assertEqual(cfg.notes, [])
+        self.assertEqual([u.name for u in cfg.users], ["me"])
+        cfg = self._load('name = "X"\npackages = ["base"]\n[kernel]\npackage = "linux-zen"\n')
+        self.assertIn("linux-zen", cfg.package_names)
+        cfg = self._load('name = "X"\npackages = ["base"]\n[bootloader]\nbios = "none"\nuefi = "none"\n')
+        self.assertEqual(cfg.package_names, ["base"])
+
+    def test_unknown_keys_reported(self):
+        cfg = self._load('name = "X"\npakages = ["vim"]\n[iso]\nvolume_idd = "A"\n')
+        self.assertTrue(any("'pakages'" in n and "'packages'" in n for n in cfg.notes))
+        self.assertTrue(any("[iso] 'volume_idd'" in n for n in cfg.notes))
+        # The classic TOML trap: a top-level key written after a table header.
+        cfg = self._load('name = "X"\n[[services]]\nname = "sshd"\nremove_paths = ["/usr/share/doc"]\n')
+        self.assertTrue(any("[[services]] #1 'remove_paths'" in n and "top-level" in n for n in cfg.notes))
+
+    def test_templates_scaffold_and_parse(self):
+        from torito.templates import TEMPLATES, scaffold_project
+
+        for name in TEMPLATES:
+            d = os.path.join(self.tmp, f"My_{name}")
+            manifest = scaffold_project(d, name)
+            cfg = load_config(manifest)
+            self.assertEqual([n for n in cfg.notes if n.startswith("unknown")], [])
+            self.assertIn("linux", cfg.package_names)
+            self.assertTrue(cfg.iso.output_path.endswith(f"my_{name}-x86_64.iso"))
+            self.assertEqual(cfg.hostname, f"my-{name}")
+            self.assertEqual(len(cfg.rootfs_overlay_dirs), 1)
+            self.assertTrue(os.path.isdir(cfg.rootfs_overlay_dirs[0]))
+            self.assertIn("/etc/sudoers.d/10-wheel", cfg.file_permissions)
+            with self.assertRaises(FileExistsError):
+                scaffold_project(d, name)
+        cfg = load_config(os.path.join(self.tmp, "My_desktop", "distro.toml"))
+        self.assertIn("autologin", cfg.users[0].groups)
+        self.assertEqual(cfg.default_target, "graphical.target")
+
+    def test_auto_network(self):
+        from torito.mutations import configure_network
+
+        def fresh():
+            vfs = PosixVfs(source_date_epoch=1)
+            vfs.init_base_hierarchy()
+            vfs.add_file("/usr/lib/systemd/system/systemd-networkd.service",
+                         b"[Install]\nWantedBy=multi-user.target\nAlso=systemd-networkd.socket\n")
+            vfs.add_file("/usr/lib/systemd/system/systemd-networkd.socket", b"[Install]\nWantedBy=sockets.target\n")
+            vfs.add_file("/usr/lib/systemd/system/systemd-resolved.service",
+                         b"[Install]\nWantedBy=multi-user.target\nAlias=dbus-org.freedesktop.resolve1.service\n")
+            vfs.add_file("/usr/lib/systemd/system/NetworkManager.service", b"[Install]\nWantedBy=multi-user.target\n")
+            return vfs
+
+        vfs = fresh()
+        configure_network(vfs, BuildConfig())
+        self.assertIsNotNone(vfs.get("/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"))
+        self.assertIsNotNone(vfs.get("/etc/systemd/system/sockets.target.wants/systemd-networkd.socket"))
+        self.assertIn(b"DHCP=yes", vfs.read_file("/etc/systemd/network/20-wired.network"))
+        self.assertEqual(vfs.get("/etc/resolv.conf").link_target, "../run/systemd/resolve/stub-resolv.conf")
+        # A manifest that enables NetworkManager is left alone.
+        vfs = fresh()
+        enable_systemd_unit(vfs, "NetworkManager")
+        configure_network(vfs, BuildConfig())
+        self.assertIsNone(vfs.get("/etc/systemd/network/20-wired.network"))
+        # …and so is one that opts out.
+        vfs = fresh()
+        cfg = BuildConfig()
+        cfg.network_auto = False
+        configure_network(vfs, cfg)
+        self.assertIsNone(vfs.get("/etc/systemd/network/20-wired.network"))
+
+    def test_pacman_mirrors_enabled(self):
+        from torito.config import RepositorySpec
+        from torito.mutations import configure_pacman_mirrors
+
+        cfg = BuildConfig()
+        cfg.repositories = [RepositorySpec("core", ["https://m1/$repo/os/$arch"]),
+                            RepositorySpec("extra", ["https://m1/$repo/os/$arch", "https://m2/$repo/os/$arch"])]
+        vfs = PosixVfs(source_date_epoch=1)
+        vfs.add_file("/etc/pacman.conf", b"[core]\nInclude = /etc/pacman.d/mirrorlist\n")
+        vfs.add_file("/etc/pacman.d/mirrorlist", b"#Server = https://commented/$repo/os/$arch\n")
+        configure_pacman_mirrors(vfs, cfg)
+        text = vfs.read_file("/etc/pacman.d/mirrorlist").decode()
+        self.assertEqual([l for l in text.splitlines() if l.startswith("Server")],
+                         ["Server = https://m1/$repo/os/$arch", "Server = https://m2/$repo/os/$arch"])
+        self.assertIn("#Server = https://commented", text)
+        # A mirrorlist that already has servers (e.g. from an overlay) is kept.
+        vfs.add_file("/etc/pacman.d/mirrorlist", b"Server = https://mine/$repo/os/$arch\n")
+        configure_pacman_mirrors(vfs, cfg)
+        self.assertEqual(vfs.read_file("/etc/pacman.d/mirrorlist"), b"Server = https://mine/$repo/os/$arch\n")
+
+    def test_iso_rejects_files_over_4gib(self):
+        from torito.iso9660 import Iso9660BuildError
+
+        b = Iso9660Builder(volume_id="BIG")
+        with self.assertRaises(Iso9660BuildError):
+            b._add("/live/x86_64/rootfs.sfs", "unused", 5 << 30, None, 0o644)
+
+
 class TestBootConfig(unittest.TestCase):
     def test_cmdline_and_entries(self):
         cfg = BuildConfig()

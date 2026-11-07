@@ -190,8 +190,14 @@ class BuildController:
         # 1 ── manifest ────────────────────────────────────────────────
         self._set_stage(BuildStage.LOADING_CONFIG)
         config = load_config(manifest_path)
+        if config.arch != "x86_64":
+            raise BuildError(f"arch = {config.arch!r} is not supported yet; Torito builds x86_64 images only")
         log(f"  Project: {config.name} {config.version} ({config.arch})")
         log(f"  Output:  {config.iso.output_path}")
+        for note in config.notes:
+            log(f"  ⚠ {note}" if note.startswith("unknown") else f"  • {note}")
+            if note.startswith("unknown"):
+                result.warnings.append(note)
         epoch = config.source_date_epoch if config.source_date_epoch is not None else int(time.time())
         os.makedirs(config.work_dir, exist_ok=True)
         os.makedirs(config.cache_dir, exist_ok=True)

@@ -31,6 +31,7 @@ from .vfs import PosixVfs, VfsNodeType
 
 SECTOR_SIZE = 2048
 LBA_SIZE = 512
+MAX_EXTENT_SIZE = 0xFFFFFFFF - SECTOR_SIZE + 1  # data length is a 32-bit field
 
 ISO_STANDARD_ID = b"CD001"
 ISO_VD_BOOT_RECORD = 0
@@ -154,6 +155,11 @@ class Iso9660Builder:
         p = self._norm(iso_path)
         if p == "/":
             raise Iso9660PathError("Cannot add a file at root path '/'")
+        if size > MAX_EXTENT_SIZE:
+            raise Iso9660BuildError(
+                f"{p} is {size / 2**30:.2f} GiB; a single ISO9660 file must stay below 4 GiB. "
+                "Trim the image (remove_paths, fewer packages) or use squashfs_compression = \"xz\"."
+            )
         self.add_directory(str(PurePosixPath(p).parent))
         self._entries[p] = _Entry(p, False, source=source, size=size, mtime=mtime or self._creation_time, mode=mode)
 

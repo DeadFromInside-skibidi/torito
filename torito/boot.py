@@ -56,7 +56,7 @@ def boot_entries(config: BuildConfig) -> List[BootEntry]:
     base = base_cmdline(config)
     entries = [
         BootEntry("live", f"{title} (live)", base),
-        BootEntry("safe", f"{title} (safe graphics)", base + " nomodeset"),
+        BootEntry("safe", f"{title} (safe graphics)", (base + " " + config.bootloader.safe_graphics_cmdline).strip()),
     ]
     if "torito.copytoram" not in base:
         entries.append(BootEntry("ram", f"{title} (copy to RAM)", base + " torito.copytoram"))

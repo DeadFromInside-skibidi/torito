@@ -6,7 +6,7 @@ torito.__main__ — CLI & GUI entry point
     python -m torito distro.toml -v       … with full telemetry
     python -m torito --inspect out.iso    report on an ISO
     python -m torito --verify out.iso     exit 1 if the ISO looks unbootable
-    python -m torito --init mydistro      scaffold a project
+    python -m torito --init mydistro      scaffold a project (--template desktop|server)
     python -m torito                      GUI
 """
 
@@ -28,62 +28,27 @@ def _utf8_console() -> None:
             pass
 
 
-SCAFFOLD_MANIFEST = """# Torito build manifest for {name}
-# Build:  python -m torito distro.toml -v
-name        = "{name}"
-version     = "1.0.0"
-arch        = "x86_64"
-hostname    = "{slug}"
-locale      = "en_US.UTF-8"
-timezone    = "UTC"
-keymap      = "us"
-default_target = "multi-user.target"
+def _scaffold_project(target_dir: str, template: str) -> int:
+    from .templates import TEMPLATES, scaffold_project
 
-# Packages come from the Arch Linux repositories (core + extra) unless
-# [[repositories]] says otherwise. Dependencies are resolved automatically.
-packages = [
-    "base", "linux", "linux-firmware",
-    "networkmanager", "sudo", "nano", "vim",
-]
-
-# Files copied over the root filesystem (Windows line endings are fixed).
-rootfs_overlay_dirs = ["overlays/rootfs"]
-
-file_permissions = {{ "/etc/sudoers.d/10-wheel" = "0:0:440" }}
-
-[[users]]
-name     = "live"
-password = "live"
-groups   = ["wheel", "audio", "video", "network", "storage", "input"]
-
-[[users]]
-name     = "root"
-password = "root"
-
-[[services]]
-name = "NetworkManager"
-
-[iso]
-output    = "output/{slug}-x86_64.iso"
-volume_id = "{label}"
-"""
+    try:
+        manifest = scaffold_project(target_dir, template)
+    except (ValueError, FileExistsError) as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+    print(f"✓ Created a '{template}' Torito project in {os.path.dirname(manifest)}")
+    print(f"  {TEMPLATES[template].summary}")
+    print(f"  Edit:  {manifest}")
+    print(f"  Build: python -m torito \"{manifest}\"")
+    return 0
 
 
-def _scaffold_project(target_dir: str) -> int:
-    abs_dir = os.path.abspath(target_dir)
-    name = os.path.basename(abs_dir.rstrip("\\/")).capitalize() or "Mydistro"
-    slug = name.lower()
-    os.makedirs(os.path.join(abs_dir, "overlays", "rootfs", "etc", "sudoers.d"), exist_ok=True)
-    os.makedirs(os.path.join(abs_dir, "output"), exist_ok=True)
-    with open(os.path.join(abs_dir, "overlays", "rootfs", "etc", "motd"), "w", encoding="utf-8", newline="\n") as f:
-        f.write(f"Welcome to {name}! Built with Torito.\n")
-    with open(os.path.join(abs_dir, "overlays", "rootfs", "etc", "sudoers.d", "10-wheel"), "w", encoding="utf-8", newline="\n") as f:
-        f.write("%wheel ALL=(ALL:ALL) ALL\n")
-    manifest = os.path.join(abs_dir, "distro.toml")
-    with open(manifest, "w", encoding="utf-8", newline="\n") as f:
-        f.write(SCAFFOLD_MANIFEST.format(name=name, slug=slug, label=(slug.upper() + "_LIVE")[:32]))
-    print(f"✓ Created Torito project at {abs_dir}")
-    print(f"  Build: python -m torito {manifest} -v")
+def _list_templates() -> int:
+    from .templates import DEFAULT_TEMPLATE, TEMPLATES
+
+    for t in TEMPLATES.values():
+        mark = " (default)" if t.name == DEFAULT_TEMPLATE else ""
+        print(f"  {t.name:<9} {t.summary}{mark}")
     return 0
 
 
@@ -96,7 +61,7 @@ def _cli_build(manifest_path: str, verbose: bool = False, keep_work: bool = Fals
     done = threading.Event()
 
     def on_log(msg: str) -> None:
-        if verbose or msg.startswith(("✗", "⚠", "  ⚠")):
+        if verbose or msg.startswith(("✗", "⚠", "  ⚠", "  •")):
             print(msg, flush=True)
 
     def on_stage(stage: BuildStage, label: str) -> None:
@@ -130,7 +95,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="torito", description="Torito — rootless Linux ISO compiler",
                                      epilog="Run without arguments to launch the GUI.")
     parser.add_argument("manifest", nargs="?", help="build manifest (.toml / .json / .ini)")
-    parser.add_argument("--init", metavar="DIR", help="scaffold a new distribution project")
+    parser.add_argument("--init", metavar="DIR", help="create a new distribution project in DIR")
+    parser.add_argument("--template", default="console",
+                        help="project template for --init: console (default), desktop, server")
+    parser.add_argument("--list-templates", action="store_true", help="show the available project templates")
     parser.add_argument("--inspect", metavar="ISO", help="print the boot structures of an ISO")
     parser.add_argument("--verify", metavar="ISO", help="verify an ISO; exit status 1 on problems")
     parser.add_argument("--gui", action="store_true", help="force GUI mode")
@@ -153,8 +121,10 @@ def main() -> None:
         if not problems:
             print("✓ no problems found")
         sys.exit(1 if problems else 0)
+    if args.list_templates:
+        sys.exit(_list_templates())
     if args.init:
-        sys.exit(_scaffold_project(args.init))
+        sys.exit(_scaffold_project(args.init, args.template))
     if args.manifest and not args.gui:
         if not os.path.isfile(args.manifest):
             print(f"Error: manifest file not found: {args.manifest}", file=sys.stderr)

@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+from . import __version__
 from .builder import (
     STAGE_LABELS,
     TOTAL_STAGES,
@@ -25,6 +26,7 @@ from .builder import (
     BuildResult,
     BuildStage,
 )
+from .templates import DEFAULT_TEMPLATE, TEMPLATES, scaffold_project
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -137,12 +139,21 @@ class ToritoApp:
             width=10,
             command=self._browse_manifest,
         )
-        self._browse_btn.pack(side=tk.LEFT)
+        self._browse_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self._new_btn = ttk.Button(
+            manifest_row,
+            text="New project…",
+            width=14,
+            command=self._new_project,
+        )
+        self._new_btn.pack(side=tk.LEFT)
 
         # Supported formats hint
         ttk.Label(
             manifest_group,
-            text="Supported formats: TOML (.toml), JSON (.json), INI (.ini / .conf)",
+            text="No manifest yet? Click “New project…” to start from a ready-made template.  "
+                 "Formats: TOML, JSON, INI",
             foreground="#666666",
         ).pack(anchor=tk.W, pady=(4, 0))
 
@@ -172,7 +183,17 @@ class ToritoApp:
             command=self._cancel_build,
             state=tk.DISABLED,
         )
-        self._cancel_btn.pack(side=tk.LEFT, padx=(0, 16))
+        self._cancel_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self._open_btn = ttk.Button(
+            controls_row,
+            text="Open output folder",
+            width=18,
+            command=self._open_output,
+            state=tk.DISABLED,
+        )
+        self._open_btn.pack(side=tk.LEFT, padx=(0, 16))
+        self._last_output = ""
 
         # Stage label
         self._stage_label = ttk.Label(
@@ -251,7 +272,7 @@ class ToritoApp:
 
         self._version_label = ttk.Label(
             status_frame,
-            text="Torito v1.0.0",
+            text=f"Torito v{__version__}",
             foreground="#999999",
         )
         self._version_label.pack(side=tk.RIGHT)
@@ -277,6 +298,59 @@ class ToritoApp:
         if path:
             self._manifest_var.set(path)
             self._status_label.configure(text=f"Manifest: {os.path.basename(path)}")
+
+    def _new_project(self) -> None:
+        """Ask for a template and a folder, scaffold a project and select it."""
+        dlg = tk.Toplevel(self._root)
+        dlg.title("New Torito project")
+        dlg.configure(bg=BG_COLOUR)
+        dlg.transient(self._root)
+        dlg.resizable(False, False)
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="What kind of system do you want to build?", style="Title.TLabel").pack(anchor=tk.W, pady=(0, 8))
+        choice = tk.StringVar(value=DEFAULT_TEMPLATE)
+        for t in TEMPLATES.values():
+            ttk.Radiobutton(frame, text=f"{t.name} — {t.summary}", value=t.name, variable=choice).pack(anchor=tk.W, pady=2)
+        ttk.Label(frame, text="Next you will pick an empty folder for the project.", foreground="#666666").pack(anchor=tk.W, pady=(8, 8))
+        picked = {"ok": False}
+
+        def ok() -> None:
+            picked["ok"] = True
+            dlg.destroy()
+
+        row = ttk.Frame(frame)
+        row.pack(anchor=tk.E)
+        ttk.Button(row, text="Choose folder…", command=ok).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT)
+        dlg.grab_set()
+        self._root.wait_window(dlg)
+        if not picked["ok"]:
+            return
+        folder = filedialog.askdirectory(title="Folder for the new project (a new, empty folder is best)",
+                                         parent=self._root, mustexist=False)
+        if not folder:
+            return
+        try:
+            manifest = scaffold_project(folder, choice.get())
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Cannot create project", str(exc), parent=self._root)
+            return
+        self._manifest_var.set(manifest)
+        self._status_label.configure(text=f"Created {manifest}")
+        self._append_console(
+            f"Created a '{choice.get()}' project:\n  {manifest}\n"
+            "Edit it in any text editor if you like, then press “Build ISO”.\n", "success")
+
+    def _open_output(self) -> None:
+        target = os.path.dirname(self._last_output) if self._last_output else ""
+        if target and os.path.isdir(target):
+            if sys.platform == "win32":
+                os.startfile(target)  # type: ignore[attr-defined]
+            else:
+                import subprocess
+
+                subprocess.Popen(["xdg-open" if sys.platform != "darwin" else "open", target])
 
     def _start_build(self) -> None:
         """Validate inputs and launch the build in a background thread."""
@@ -306,6 +380,8 @@ class ToritoApp:
         self._build_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
         self._browse_btn.configure(state=tk.DISABLED)
+        self._new_btn.configure(state=tk.DISABLED)
+        self._open_btn.configure(state=tk.DISABLED)
         self._manifest_entry.configure(state=tk.DISABLED)
         self._progress_var.set(0.0)
 
@@ -409,6 +485,10 @@ class ToritoApp:
 
         if result.success:
             self._progress_var.set(100.0)
+            self._last_output = result.output_path
+            self._open_btn.configure(state=tk.NORMAL)
+            for w in result.warnings:
+                self._append_console(f"⚠ {w}\n", "warn")
             size_mb = result.output_size / (1024 * 1024)
             self._append_console(
                 f"✓ Build succeeded in {result.elapsed_seconds:.2f}s\n",
@@ -430,8 +510,9 @@ class ToritoApp:
                 f"ISO image built successfully!\n\n"
                 f"Output: {result.output_path}\n"
                 f"Size: {size_mb:.1f} MB\n"
-                f"Time: {result.elapsed_seconds:.2f}s\n"
-                f"VFS Nodes: {result.node_count:,}",
+                f"Time: {result.elapsed_seconds:.2f}s\n\n"
+                "Try it in a virtual machine (VirtualBox, VMware, Hyper-V Gen 2 with "
+                "Secure Boot off) or write it to a USB stick with Rufus in DD mode.",
                 parent=self._root,
             )
         else:
@@ -453,6 +534,7 @@ class ToritoApp:
         self._build_btn.configure(state=tk.NORMAL)
         self._cancel_btn.configure(state=tk.DISABLED)
         self._browse_btn.configure(state=tk.NORMAL)
+        self._new_btn.configure(state=tk.NORMAL)
         self._manifest_entry.configure(state=tk.NORMAL)
 
     # ──────────────────────────────────────────────────────────────

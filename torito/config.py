@@ -99,6 +99,7 @@ class BootloaderSpec:
     timeout: int = 5
     menu_title: str = ""
     extra_entries: List[Dict[str, str]] = field(default_factory=list)  # {title, cmdline}
+    safe_graphics_cmdline: str = "nomodeset"  # arguments of the "safe graphics" entry
     boot_catalog_path: str = "boot/boot.cat"
 
 
@@ -158,6 +159,101 @@ class BuildConfig:
     timezone: str = "UTC"
     keymap: str = "us"
     os_release: Dict[str, str] = field(default_factory=dict)
+    # Configure DHCP on wired interfaces with systemd-networkd/resolved when
+    # the manifest does not enable a network manager of its own.
+    network_auto: bool = True
+    # Things Torito decided on the user's behalf, or manifest problems worth
+    # reporting (unknown keys …). The builder prints them.
+    notes: List[str] = field(default_factory=list)
+
+
+KERNEL_PACKAGES = ("linux", "linux-lts", "linux-zen", "linux-hardened", "linux-rt", "linux-rt-lts")
+
+_KNOWN_KEYS: Dict[str, set] = {
+    "": {
+        "name", "version", "arch", "hostname", "locale", "timezone", "keymap", "default_target",
+        "cache_dir", "work_dir", "source_date_epoch", "rootfs_overlay_dirs", "overlays", "remove_paths",
+        "file_permissions", "package_preferences", "ignore_packages", "os_release", "packages",
+        "package_files", "repositories", "repos", "mirrors", "kernel", "bootloader", "live", "iso",
+        "users", "groups", "services", "network",
+    },
+    "kernel": {
+        "package", "vmlinuz", "vmlinuz_path", "modules_dir", "cmdline", "initramfs_modules",
+        "initramfs_extra_dirs", "initramfs_extra_files", "initramfs_compression", "microcode",
+    },
+    "bootloader": {
+        "bios", "uefi", "efi_binary", "efi_binary_path", "bios_binary", "bios_binary_path", "timeout",
+        "menu_title", "extra_entries", "safe_graphics_cmdline", "boot_catalog",
+    },
+    "live": {"copytoram", "overlay_size", "serial_console"},
+    "iso": {
+        "output", "output_path", "volume_id", "volume_set_id", "publisher_id", "application_id",
+        "system_id", "squashfs_compression", "squashfs_block_size", "squashfs_level", "hybrid",
+    },
+    "network": {"auto"},
+    "users": {"name", "uid", "gid", "home", "shell", "password", "groups", "gecos", "create_home"},
+    "groups": {"name", "gid", "members"},
+    "services": {"name", "init_system", "target", "runlevel", "user", "global", "mask"},
+}
+
+
+def _check_unknown_keys(d: Dict[str, Any], notes: List[str]) -> None:
+    import difflib
+
+    def check(table: Dict[str, Any], section: str, where: str) -> None:
+        known = _KNOWN_KEYS[section]
+        for key in table:
+            if key in known:
+                continue
+            msg = f"unknown manifest key {where}'{key}' (ignored)"
+            if key in _KNOWN_KEYS[""] and section:
+                msg += f" — it is a top-level setting; move it above the first [table] header"
+            else:
+                hint = difflib.get_close_matches(key, known, n=1)
+                if hint:
+                    msg += f" — did you mean '{hint[0]}'?"
+            notes.append(msg)
+
+    check(d, "", "")
+    for section in ("kernel", "bootloader", "live", "iso", "network"):
+        if isinstance(d.get(section), dict):
+            check(d[section], section, f"[{section}] ")
+    for section in ("users", "groups", "services"):
+        if isinstance(d.get(section), list):
+            for i, entry in enumerate(d[section]):
+                if isinstance(entry, dict):
+                    check(entry, section, f"[[{section}]] #{i + 1} ")
+
+
+def default_hostname(name: str) -> str:
+    h = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:63]
+    return h or "torito"
+
+
+def apply_smart_defaults(cfg: BuildConfig) -> None:
+    """
+    Make the obvious things work without the user having to know about them:
+    a repository build with no kernel gets ``linux``, and one with no init
+    system gets ``base`` (systemd, coreutils, …). Local package builds are
+    left alone — the user is assembling the system by hand.
+    """
+    if not cfg.users:
+        cfg.users.append(UserSpec(name="root", password=""))
+        cfg.notes.append("no [[users]] given: root can log in on the console without a password")
+    if cfg.packages:
+        return
+    want_kernel = cfg.bootloader.bios != "none" or cfg.bootloader.uefi != "none"
+    names = cfg.package_names
+    if not any(n in ("base", "systemd") for n in names):
+        names.insert(0, "base")
+        cfg.notes.append("added package 'base' (init system and core tools) — every bootable system needs it")
+    if want_kernel and not cfg.kernel.vmlinuz_path:
+        if cfg.kernel.package and cfg.kernel.package not in names:
+            names.append(cfg.kernel.package)
+            cfg.notes.append(f"added kernel package '{cfg.kernel.package}' from [kernel] package")
+        elif not any(n in KERNEL_PACKAGES for n in names) and not cfg.kernel.package:
+            names.append("linux")
+            cfg.notes.append("added kernel package 'linux' (no kernel listed in packages)")
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +309,11 @@ def sanitise_volume_id(vol: str) -> str:
 
 
 def _populate_from_dict(cfg: BuildConfig, d: Dict[str, Any], project_dir: str) -> None:
+    _check_unknown_keys(d, cfg.notes)
     cfg.name = str(d.get("name", cfg.name))
     cfg.version = str(d.get("version", cfg.version))
     cfg.arch = str(d.get("arch", cfg.arch))
-    cfg.hostname = str(d.get("hostname", cfg.hostname))
+    cfg.hostname = str(d.get("hostname") or default_hostname(cfg.name))
     cfg.locale = str(d.get("locale", cfg.locale))
     cfg.timezone = str(d.get("timezone", cfg.timezone))
     cfg.keymap = str(d.get("keymap", cfg.keymap))
@@ -287,6 +384,7 @@ def _populate_from_dict(cfg: BuildConfig, d: Dict[str, Any], project_dir: str) -
         b.timeout = int(bl.get("timeout", b.timeout))
         b.menu_title = str(bl.get("menu_title", b.menu_title))
         b.extra_entries = [dict(e) for e in bl.get("extra_entries", b.extra_entries)]
+        b.safe_graphics_cmdline = str(bl.get("safe_graphics_cmdline", b.safe_graphics_cmdline))
         b.boot_catalog_path = str(bl.get("boot_catalog", b.boot_catalog_path))
 
     lv = d.get("live", {})
@@ -308,7 +406,17 @@ def _populate_from_dict(cfg: BuildConfig, d: Dict[str, Any], project_dir: str) -
         i.squashfs_block_size = int(iso.get("squashfs_block_size", i.squashfs_block_size))
         i.squashfs_level = int(iso.get("squashfs_level", i.squashfs_level))
         i.hybrid = bool(iso.get("hybrid", i.hybrid))
+    iso_d = iso if isinstance(iso, dict) else {}
+    slug = re.sub(r"[^a-z0-9_-]+", "-", cfg.name.lower()).strip("-_") or "torito"
+    if "output" not in iso_d and "output_path" not in iso_d:
+        cfg.iso.output_path = f"output/{slug}-x86_64.iso"
+    if "volume_id" not in iso_d:
+        cfg.iso.volume_id = slug.upper()[:26] + "_LIVE"
     cfg.iso.volume_id = sanitise_volume_id(cfg.iso.volume_id)
+
+    net = d.get("network", {})
+    if isinstance(net, dict):
+        cfg.network_auto = bool(net.get("auto", cfg.network_auto))
 
     for u in d.get("users", []):
         if isinstance(u, dict):
@@ -360,6 +468,7 @@ def load_config(manifest_path: str) -> BuildConfig:
     cfg.iso.output_path = absp(cfg.iso.output_path)
     cfg.cache_dir = absp(cfg.cache_dir)
     cfg.work_dir = absp(cfg.work_dir)
+    apply_smart_defaults(cfg)
     # Repository package names given without any repository → Arch core+extra.
     if cfg.package_names and not cfg.repositories:
         cfg.repositories = [
@@ -375,14 +484,16 @@ def _load_toml(path: str, project_dir: str) -> BuildConfig:
     except ImportError:  # pragma: no cover
         import tomli as tomllib  # type: ignore[no-redef]
     with open(path, "rb") as fh:
-        data = tomllib.load(fh)
+        raw = fh.read()
+    # Windows editors (Notepad, PowerShell 5) like to prepend a UTF-8 BOM.
+    data = tomllib.loads(raw.decode("utf-8-sig"))
     cfg = BuildConfig()
     _populate_from_dict(cfg, data, project_dir)
     return cfg
 
 
 def _load_json(path: str, project_dir: str) -> BuildConfig:
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, "r", encoding="utf-8-sig") as fh:
         data = json.load(fh)
     cfg = BuildConfig()
     _populate_from_dict(cfg, data, project_dir)

@@ -37,7 +37,13 @@ DEFAULT_MIRRORS: List[str] = [
     "https://mirrors.edge.kernel.org/archlinux/$repo/os/$arch",
 ]
 
-USER_AGENT = "torito/2.0 (+https://github.com/DeadFromInside-skibidi/torito)"
+def _user_agent() -> str:
+    from . import __version__
+
+    return f"torito/{__version__} (+https://github.com/DeadFromInside-skibidi/torito)"
+
+
+USER_AGENT = _user_agent()
 
 # When several packages provide the same virtual dependency, these win
 # unless the manifest says otherwise.  Mirrors the answers most people give
@@ -444,7 +450,14 @@ class PackageDatabase:
                 return
             pkg = self.find_satisfier(dep, selected, prefs)
             if pkg is None:
-                missing.append(f"{dep} (required by {parent or 'manifest'})")
+                hint = ""
+                if parent is None:
+                    import difflib
+
+                    close = difflib.get_close_matches(dep_name(dep), list(self.by_name) + list(self.groups), n=3, cutoff=0.75)
+                    if close:
+                        hint = " — did you mean " + " / ".join(f"'{c}'" for c in close) + "?"
+                missing.append(f"{dep} (required by {parent or 'manifest'}){hint}")
                 return
             if pkg.name in selected or pkg.name in visiting:
                 return
@@ -461,7 +474,11 @@ class PackageDatabase:
             visit(dep, parent)
 
         if missing:
-            raise RepoError("unresolvable dependencies:\n  " + "\n  ".join(missing))
+            raise RepoError(
+                "these packages are not in the configured repositories:\n  " + "\n  ".join(missing)
+                + "\n  (search https://archlinux.org/packages/ for the exact name; AUR packages must be"
+                " built elsewhere and listed as local .pkg.tar.zst files)"
+            )
 
         # Conflict sanity check (report, do not fail on self-provides).
         provided: Dict[str, List[Tuple[str, str]]] = {}

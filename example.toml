@@ -3,7 +3,12 @@
 # Build:   python -m torito example.toml -v
 # Result:  output/mylinux-x86_64.iso (boots on BIOS and UEFI, CD/DVD or USB)
 #
-# Everything below is optional except `name` and `packages`.
+# Everything below is optional except `name`. If `packages` has no kernel
+# or no `base`, Torito adds `linux` / `base` for you.
+#
+# TOML gotcha: plain `key = value` settings must come before the first
+# [table] / [[table]] header — after one, they belong to that table.
+# Torito warns about keys it does not recognise.
 
 name        = "MyLinux"
 version     = "1.0.0"
@@ -68,6 +73,12 @@ name = "sshd"
 # [[services]]
 # name = "pipewire.socket"
 # user = true                            # systemctl --global enable
+
+# --- Networking --------------------------------------------------------------------
+# With no network manager enabled above, Torito sets up systemd-networkd (DHCP
+# on every wired interface) + systemd-resolved so the live system is online.
+# [network]
+# auto = false                            # opt out
 
 # --- Boot --------------------------------------------------------------------------
 [kernel]
